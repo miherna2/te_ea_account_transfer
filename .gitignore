@@ -1,0 +1,32 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+
+# Lab-specific inventory and generated reports
+inventory.csv
+reports/
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and build artifacts
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Symlinked virtual environment
+.venv
