@@ -141,6 +141,16 @@ def _group_from_env(
     help="Strategy C source-test policy; ignored for A/B.",
 )
 @click.option(
+    "--create-missing-tags",
+    is_flag=True,
+    help="Strategy C: create/reuse missing target tags and attach them to tests.",
+)
+@click.option(
+    "--create-missing-alerts",
+    is_flag=True,
+    help="Strategy C: create/reuse missing target alert rules and attach them to tests.",
+)
+@click.option(
     "--timeout",
     type=click.IntRange(min=1),
     default=180,
@@ -168,6 +178,8 @@ def main(
     inventory: Path,
     strategy: str | None,
     stale_policy: str | None,
+    create_missing_tags: bool,
+    create_missing_alerts: bool,
     timeout: int,
     parallelism: int,
     output: Path,
@@ -211,6 +223,25 @@ def main(
         selected_stale_policy = _resolve_source_test_policy(
             selected_strategy, stale_policy, report, console
         )
+        strategy_c = selected_strategy is TestStrategy.RECREATE
+        effective_create_missing_tags = strategy_c and create_missing_tags
+        effective_create_missing_alerts = strategy_c and create_missing_alerts
+        tag_policy = (
+            "enabled"
+            if effective_create_missing_tags
+            else "disabled" if strategy_c else "not-applicable"
+        )
+        alert_policy = (
+            "enabled"
+            if effective_create_missing_alerts
+            else "disabled" if strategy_c else "not-applicable"
+        )
+        report.record_decision("Strategy C create missing tags", tag_policy)
+        report.record_decision("Strategy C create missing alert rules", alert_policy)
+        console.info(
+            "configuration",
+            f"Strategy C tag reconciliation={tag_policy}; alert reconciliation={alert_policy}",
+        )
         console.info(
             "input",
             "resolving UI credentials and tokens; secret values are hidden and never logged",
@@ -229,6 +260,8 @@ def main(
             stale_policy=selected_stale_policy,
             timeout_seconds=timeout,
             parallelism=parallelism,
+            create_missing_tags=effective_create_missing_tags,
+            create_missing_alerts=effective_create_missing_alerts,
             verbose=verbose,
         )
         with ThousandEyesApiClient(api_token) as api:

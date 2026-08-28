@@ -34,7 +34,12 @@ from te_agent_migrate.models import (
 from te_agent_migrate.operator import OperatorPrompter
 from te_agent_migrate.output import MigrationConsole
 from te_agent_migrate.reporting import RunReport
-from te_agent_migrate.strategies import API_TEST_TYPES, TestStrategyExecutor, action_dict
+from te_agent_migrate.strategies import (
+    API_TEST_TYPES,
+    MONITOR_BASED_TEST_TYPES,
+    TestStrategyExecutor,
+    action_dict,
+)
 from te_agent_migrate.ui_client import TevaUiClient, boolean_from_snapshot
 
 UiFactory = Callable[[InventoryAgent], TevaUiClient]
@@ -76,6 +81,33 @@ def test_agent_ids(test: TestRecord) -> set[str]:
     return values
 
 
+def test_monitor_ids(test: TestRecord) -> set[str]:
+    """Normalize expanded BGP monitor identifiers for portability checks."""
+    values: set[str] = set()
+    raw_monitors = test.raw.get("monitors", [])
+    if not isinstance(raw_monitors, list):
+        return values
+    for monitor in raw_monitors:
+        value = (
+            monitor.get("monitorId", monitor.get("id"))
+            if isinstance(monitor, dict)
+            else monitor
+        )
+        if value is not None and str(value):
+            values.add(str(value))
+    return values
+
+
+def monitor_catalog_ids(monitors: list[dict[str, Any]]) -> set[str]:
+    """Normalize monitor IDs returned by GET /v7/monitors."""
+    values: set[str] = set()
+    for monitor in monitors:
+        value = monitor.get("monitorId", monitor.get("id"))
+        if value is not None and str(value):
+            values.add(str(value))
+    return values
+
+
 class MigrationRunner:
     def __init__(
         self,
@@ -103,9 +135,11 @@ class MigrationRunner:
         self._destructive_confirmed = False
         self._source_test_cleanup_candidates: dict[tuple[str, str], TestRecord] = {}
         self._source_test_known_agent_ids: dict[tuple[str, str], set[str]] = {}
+        self._source_test_preserved_agent_ids: dict[tuple[str, str], set[str]] = {}
         self._completed_source_agent_ids: set[str] = set()
         self._strategy_c_source_tests: dict[str, TestRecord] = {}
         self._strategy_c_unassigned_tests: list[TestRecord] = []
+        self._strategy_c_monitor_tests: list[TestRecord] = []
         self._completed_target_agents: dict[str, tuple[InventoryAgent, AgentRecord]] = {}
         self._recap: list[dict[str, str]] = []
         self._confirmation_lock = RLock()
@@ -169,6 +203,16 @@ class MigrationRunner:
                 ),
                 "source_test_policy": (
                     self.options.stale_policy.value
+                    if self.options.strategy.value == "C"
+                    else "not-applicable"
+                ),
+                "strategy_c_create_missing_tags": (
+                    self.options.create_missing_tags
+                    if self.options.strategy.value == "C"
+                    else "not-applicable"
+                ),
+                "strategy_c_create_missing_alert_rules": (
+                    self.options.create_missing_alerts
                     if self.options.strategy.value == "C"
                     else "not-applicable"
                 ),
@@ -248,6 +292,7 @@ class MigrationRunner:
                 self.report.write_incremental()
                 raise HumanDecisionRequired("Operator paused the run between batches")
         self._handle_strategy_c_unassigned_tests(inventory)
+        self._handle_strategy_c_monitor_tests(inventory)
         if self.options.mode is Mode.APPLY:
             self._cleanup_source_tests()
         self.report.write_final()
@@ -324,9 +369,14 @@ class MigrationRunner:
                     ip_address=inventory_agent.ip_address,
                     online_only=True,
                 )
+                target_detail = (
+                    "not-required-in-dry-run"
+                    if self.options.mode is Mode.DRY_RUN
+                    else str(target is not None)
+                )
                 detail = (
                     f"read-only recheck: ui_reachable={ui_reachable}, "
-                    f"target_online={target is not None}"
+                    f"target_online={target_detail}"
                 )
             except MigrationError as exc:
                 detail = f"read-only recheck failed: {exc}"
@@ -337,6 +387,28 @@ class MigrationRunner:
                 StepStatus.OK if ui_reachable else StepStatus.PAUSED,
                 detail,
             )
+            if self.options.mode is Mode.DRY_RUN and ui_reachable:
+                try:
+                    with self.step(
+                        correlation_id,
+                        inventory_agent.hostname,
+                        "dry_run_retry",
+                        start_detail="retrying all read-only checks after successful recheck",
+                    ):
+                        self._run_agent(inventory_agent, correlation_id)
+                except Exception as exc:
+                    detail = f"dry-run retry failed: {exc}"
+                    allow_recheck = not isinstance(exc, ApiError)
+                    continue
+                for row in reversed(self._recap):
+                    if (
+                        row.get("agent") == inventory_agent.hostname
+                        and row.get("status") == "failed"
+                    ):
+                        row["status"] = "ok"
+                        row["detail"] = "dry-run retry succeeded after read-only recheck"
+                        break
+                return True
 
     def _run_agent(self, inventory_agent: InventoryAgent, correlation_id: str) -> None:
         with self.step(correlation_id, inventory_agent.hostname, "api_prevalidation"):
@@ -762,13 +834,25 @@ class MigrationRunner:
             "strategy_c_source_test_inventory",
             start_detail="capturing all source tests and agent associations before migration",
         ):
-            source_agents = self.api.list_agents(self.source_group.aid)
+            source_agents = self.api.list_agents(
+                self.source_group.aid,
+                agent_types="CLOUD,ENTERPRISE",
+            )
+            target_agents = self.api.list_agents(
+                self.target_group.aid,
+                agent_types="CLOUD,ENTERPRISE",
+            )
+            source_enterprise_agents = [
+                agent
+                for agent in source_agents
+                if agent.agent_type in {None, "enterprise"}
+            ]
             selected_source_agents = [
                 match
                 for item in inventory
                 if (
                     match := self.api.match_agent(
-                        source_agents,
+                        source_enterprise_agents,
                         hostname=item.hostname,
                         ip_address=item.ip_address,
                     )
@@ -782,14 +866,29 @@ class MigrationRunner:
             ]
 
         selected_source_agent_ids = {agent.agent_id for agent in selected_source_agents}
+        source_agents_by_id = {agent.agent_id: agent for agent in source_agents}
+        target_agents_by_id = {agent.agent_id: agent for agent in target_agents}
         outside_inventory: dict[str, list[str]] = {}
         for test in details:
             source_agent_ids = test_agent_ids(test)
-            unknown_agent_ids = sorted(source_agent_ids - selected_source_agent_ids)
+            portable_agent_ids = {
+                agent_id
+                for agent_id in source_agent_ids - selected_source_agent_ids
+                if (
+                    (source_agent := source_agents_by_id.get(agent_id)) is not None
+                    and source_agent.agent_type == "cloud"
+                    and (target_agent := target_agents_by_id.get(agent_id)) is not None
+                    and target_agent.agent_type == "cloud"
+                )
+            }
+            unknown_agent_ids = sorted(
+                source_agent_ids - selected_source_agent_ids - portable_agent_ids
+            )
             if unknown_agent_ids:
                 outside_inventory[test.test_id] = unknown_agent_ids
             key = (test.test_type, test.test_id)
             self._source_test_known_agent_ids[key] = set(source_agent_ids)
+            self._source_test_preserved_agent_ids[key] = portable_agent_ids
 
         if outside_inventory:
             summary = "; ".join(
@@ -802,12 +901,65 @@ class MigrationRunner:
             )
 
         self._strategy_c_source_tests = {test.test_id: test for test in details}
-        self._strategy_c_unassigned_tests = [test for test in details if not test_agent_ids(test)]
+        self._strategy_c_monitor_tests = [
+            test for test in details if test.test_type in MONITOR_BASED_TEST_TYPES
+        ]
+        self._strategy_c_unassigned_tests = [
+            test
+            for test in details
+            if test.test_type not in MONITOR_BASED_TEST_TYPES and not test_agent_ids(test)
+        ]
+        if self._strategy_c_monitor_tests:
+            target_monitor_ids = monitor_catalog_ids(
+                self.api.list_monitors(self.target_group.aid)
+            )
+            missing_monitors = {
+                test.test_id: sorted(test_monitor_ids(test) - target_monitor_ids)
+                for test in self._strategy_c_monitor_tests
+                if test_monitor_ids(test) - target_monitor_ids
+            }
+            if missing_monitors:
+                summary = "; ".join(
+                    f"test {test_id}: {','.join(monitor_ids)}"
+                    for test_id, monitor_ids in sorted(missing_monitors.items())
+                )
+                raise HardStop(
+                    "Strategy C cannot safely recreate monitor-based tests because some "
+                    f"source monitor IDs are unavailable in the target account group ({summary})"
+                )
         all_inventory_agents_matched = len(selected_source_agents) == len(inventory)
         if self._strategy_c_unassigned_tests and not all_inventory_agents_matched:
             raise HardStop(
                 "Strategy C found unassigned source tests but not every inventory agent exists "
                 "in the source account group; assign-all would be ambiguous"
+            )
+
+        recreatable_tests = [test for test in details if test.test_type in API_TEST_TYPES]
+        if (
+            self.options.mode is Mode.APPLY
+            and (
+                self.options.create_missing_tags
+                or self.options.create_missing_alerts
+            )
+        ):
+            self._ensure_destructive_confirmation()
+        with self.step(
+            correlation_id,
+            None,
+            "strategy_c_resource_reconciliation",
+            start_detail=(
+                "reconciling requested tags and alert rules before any agent move"
+                if self.options.create_missing_tags or self.options.create_missing_alerts
+                else "tag and alert-rule creation disabled; tests will omit both"
+            ),
+        ):
+            resource_summary = self.strategy.prepare_recreate_resources(
+                source_tests=recreatable_tests,
+                source_aid=self.source_group.aid,
+                target_aid=self.target_group.aid,
+                create_missing_tags=self.options.create_missing_tags,
+                create_missing_alerts=self.options.create_missing_alerts,
+                dry_run=self.options.mode is Mode.DRY_RUN,
             )
 
         self.report.metadata.update(
@@ -817,8 +969,37 @@ class MigrationRunner:
                     self._strategy_c_unassigned_tests
                 ),
                 "strategy_c_unassigned_test_policy": "assign-all-migrated-agents",
+                "strategy_c_monitor_based_source_test_count": len(
+                    self._strategy_c_monitor_tests
+                ),
+                "strategy_c_monitor_based_test_policy": (
+                    "recreate-once-preserve-monitors-no-agent-assignment"
+                ),
                 "strategy_c_test_name_policy": "preserve-exact",
+                "strategy_c_preserved_cloud_agent_association_count": sum(
+                    len(agent_ids)
+                    for agent_ids in self._source_test_preserved_agent_ids.values()
+                ),
+                "strategy_c_tags_created": resource_summary.tags_created,
+                "strategy_c_tags_reused": resource_summary.tags_reused,
+                "strategy_c_tags_projected": resource_summary.tags_projected,
+                "strategy_c_alert_rules_created": resource_summary.alert_rules_created,
+                "strategy_c_alert_rules_reused": resource_summary.alert_rules_reused,
+                "strategy_c_alert_rules_projected": (
+                    resource_summary.alert_rules_projected
+                ),
             }
+        )
+        self.console.info(
+            "strategy_c_resource_reconciliation",
+            (
+                f"tags created={resource_summary.tags_created}, "
+                f"reused={resource_summary.tags_reused}, "
+                f"projected={resource_summary.tags_projected}; "
+                f"alert rules created={resource_summary.alert_rules_created}, "
+                f"reused={resource_summary.alert_rules_reused}, "
+                f"projected={resource_summary.alert_rules_projected}"
+            ),
         )
         self._event(
             correlation_id,
@@ -828,7 +1009,9 @@ class MigrationRunner:
             (
                 f"captured {len(details)} source test(s); "
                 f"{len(self._strategy_c_unassigned_tests)} unassigned test(s) will be assigned "
-                "to every migrated inventory agent"
+                "to every migrated inventory agent; "
+                f"{len(self._strategy_c_monitor_tests)} monitor-based test(s) will be "
+                "recreated once without agent associations"
             ),
         )
 
@@ -876,7 +1059,8 @@ class MigrationRunner:
                         "target_agent_ids": target_agent_ids,
                         "target_agent_names": target_agent_names,
                         "enabled": True,
-                        "source_alert_rules_preserved": False,
+                        "source_tags_preserved": self.options.create_missing_tags,
+                        "source_alert_rules_preserved": self.options.create_missing_alerts,
                     }
                 )
                 self.report.add_stale_entry(
@@ -924,6 +1108,124 @@ class MigrationRunner:
             ),
         )
 
+    def _handle_strategy_c_monitor_tests(
+        self, inventory: list[InventoryAgent]
+    ) -> None:
+        if self.options.strategy.value != "C" or not self._strategy_c_monitor_tests:
+            return
+
+        correlation_id = str(uuid.uuid4())
+        completed = [
+            self._completed_target_agents[item.hostname]
+            for item in inventory
+            if item.hostname in self._completed_target_agents
+        ]
+        if len(completed) != len(inventory):
+            self._event(
+                correlation_id,
+                None,
+                "strategy_c_monitor_tests",
+                StepStatus.SKIPPED,
+                "Monitor-based source tests retained because not every inventory agent completed",
+            )
+            return
+
+        context_agent, target_agent = completed[0]
+        dry_run = self.options.mode is Mode.DRY_RUN
+        target_tests = self.api.list_tests(self.target_group.aid)
+        for test in self._strategy_c_monitor_tests:
+            with self._test_lock:
+                action = self.strategy.apply(
+                    strategy=self.options.strategy,
+                    source_test=test,
+                    source_aid=self.source_group.aid,
+                    target_aid=self.target_group.aid,
+                    target_agent=target_agent,
+                    target_tests=target_tests,
+                    dry_run=dry_run,
+                    create_missing_tags=self.options.create_missing_tags,
+                    create_missing_alerts=self.options.create_missing_alerts,
+                )
+
+            row = action_dict(action)
+            row.update(
+                {
+                    "agent": "monitor-based",
+                    "source_aid": self.source_group.aid,
+                    "target_aid": self.target_group.aid,
+                    "target_agent_id": None,
+                    "enabled": True,
+                    "source_tags_preserved": self.options.create_missing_tags,
+                    "source_alert_rules_preserved": self.options.create_missing_alerts,
+                    "monitor_ids": sorted(test_monitor_ids(test)),
+                    "monitor_count": len(test_monitor_ids(test)),
+                }
+            )
+            if action.status == "unsupported":
+                self.report.add_unsupported_test(row)
+            else:
+                self.report.add_test(row)
+
+            if (
+                not dry_run
+                and action.status in {"changed", "existing"}
+                and action.target_test_id is not None
+            ):
+                with self.step(
+                    correlation_id,
+                    None,
+                    "api_target_monitor_test_ready",
+                    start_detail=(
+                        f"verifying monitor-based target test {action.target_test_id} is enabled "
+                        "with its exact name, prefix, and monitors"
+                    ),
+                ):
+                    self.api.wait_for_monitor_test_ready(
+                        self.target_group.aid,
+                        test_type=action.test_type,
+                        test_id=action.target_test_id,
+                        expected_name=test.name,
+                        expected_prefix=str(test.raw.get("prefix", "")),
+                        expected_use_public_bgp=bool(
+                            test.raw.get("usePublicBgp", False)
+                        ),
+                        expected_monitor_ids=test_monitor_ids(test),
+                        timeout_seconds=self.options.timeout_seconds,
+                        on_poll=lambda attempt, remaining: self.console.info(
+                            "global",
+                            f"target-monitor-test poll {attempt}; {remaining:.0f}s remaining",
+                        ),
+                    )
+
+            self._record_source_test_policy(
+                test,
+                action.status,
+                context_agent,
+                dry_run,
+                agent_label="monitor-based",
+            )
+            self._event(
+                correlation_id,
+                None,
+                f"test_{action.action}",
+                StepStatus.SKIPPED
+                if action.status in {"skipped", "unsupported"}
+                else StepStatus.CHANGED,
+                action.detail,
+            )
+
+        self._event(
+            correlation_id,
+            None,
+            "strategy_c_monitor_tests",
+            StepStatus.CHANGED,
+            (
+                f"{'projected' if dry_run else 'migrated'} "
+                f"{len(self._strategy_c_monitor_tests)} monitor-based test(s) exactly once "
+                "without agent associations"
+            ),
+        )
+
     def _source_tests(self, source: AgentRecord | None) -> list[TestRecord]:
         if source is None or not source.test_ids:
             return []
@@ -939,6 +1241,8 @@ class MigrationRunner:
                         }
                     )
                     continue
+                if test.test_type in MONITOR_BASED_TEST_TYPES:
+                    continue
                 snapshot_details.append(test)
             return snapshot_details
         summaries = {test.test_id: test for test in self.api.list_tests(self.source_group.aid)}
@@ -949,6 +1253,11 @@ class MigrationRunner:
                 self.report.add_unsupported_test(
                     {"test_id": test_id, "reason": "Assigned test not visible in source inventory"}
                 )
+                continue
+            if (
+                self.options.strategy.value == "C"
+                and summary.test_type in MONITOR_BASED_TEST_TYPES
+            ):
                 continue
             details.append(
                 self.api.get_test(self.source_group.aid, summary.test_type, summary.test_id)
@@ -999,6 +1308,14 @@ class MigrationRunner:
                 target_agent=target,
                 target_tests=target_tests,
                 dry_run=dry_run,
+                create_missing_tags=self.options.create_missing_tags,
+                create_missing_alerts=self.options.create_missing_alerts,
+                preserved_agent_ids=sorted(
+                    self._source_test_preserved_agent_ids.get(
+                        (test.test_type, test.test_id),
+                        set(),
+                    )
+                ),
             )
             row = action_dict(action)
             row.update(
@@ -1013,7 +1330,14 @@ class MigrationRunner:
                         and action.status in {"changed", "existing", "projected"}
                         else test.enabled
                     ),
-                    "source_alert_rules_preserved": self.options.strategy.value != "C",
+                    "source_tags_preserved": (
+                        self.options.strategy.value != "C"
+                        or self.options.create_missing_tags
+                    ),
+                    "source_alert_rules_preserved": (
+                        self.options.strategy.value != "C"
+                        or self.options.create_missing_alerts
+                    ),
                 }
             )
             if action.status == "unsupported":
@@ -1071,6 +1395,7 @@ class MigrationRunner:
         dry_run: bool,
         *,
         source_agent_id: str | None = None,
+        agent_label: str | None = None,
     ) -> None:
         successfully_recreated = action_status in {"changed", "existing", "projected"}
         key = (test.test_type, test.test_id)
@@ -1089,7 +1414,7 @@ class MigrationRunner:
         self.report.add_stale_entry(
             {
                 "entry_type": "source-test",
-                "agent": inventory_agent.hostname,
+                "agent": agent_label or inventory_agent.hostname,
                 "source_test_id": test.test_id,
                 "source_test_name": test.name,
                 "test_type": test.test_type,
@@ -1132,7 +1457,10 @@ class MigrationRunner:
         for test in self._source_test_cleanup_candidates.values():
             key = (test.test_type, test.test_id)
             known_agent_ids = self._source_test_known_agent_ids.get(key, set())
-            expected_source_agent_ids = test_agent_ids(test) | known_agent_ids
+            preserved_agent_ids = self._source_test_preserved_agent_ids.get(key, set())
+            expected_source_agent_ids = (
+                test_agent_ids(test) | known_agent_ids
+            ) - preserved_agent_ids
             missing_source_agent_ids = sorted(
                 expected_source_agent_ids - self._completed_source_agent_ids
             )

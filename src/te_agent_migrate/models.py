@@ -62,6 +62,7 @@ class AgentRecord:
     labels: list[dict[str, Any]] = field(default_factory=list)
     test_ids: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
+    agent_type: str | None = None
 
     @property
     def online(self) -> bool:
@@ -95,6 +96,11 @@ class AgentRecord:
             labels=list(value.get("labels", value.get("tags", [])) or []),
             test_ids=tests,
             raw=value,
+            agent_type=(
+                str(value["agentType"]).casefold()
+                if value.get("agentType") is not None
+                else None
+            ),
         )
 
 
@@ -157,3 +163,5 @@ class RunOptions:
     timeout_seconds: int = 180
     parallelism: int = 1
     verbose: bool = False
+    create_missing_tags: bool = False
+    create_missing_alerts: bool = False

@@ -106,7 +106,10 @@ class TevaUiClient:
                 self._update_session_state(response)
             except httpx.RequestError as exc:
                 if attempt == attempts:
-                    if os.getenv("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+                    if (
+                        os.getenv("CODEX_SANDBOX_NETWORK_DISABLED") == "1"
+                        and os.getenv("TE_ALLOW_CODEX_SANDBOX_NETWORK") != "1"
+                    ):
                         raise UiError(
                             f"{method} {path} could not reach {self.host} over HTTPS/443 because "
                             "the Codex network sandbox blocks direct LAN connections; run from "

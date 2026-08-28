@@ -236,6 +236,8 @@ uv run te-agent-migrate \
   --inventory inventory.csv \
   --strategy C \
   --stale keep \
+  --create-missing-tags \
+  --create-missing-alerts \
   --parallel 3 \
   --timeout 180
 ```
@@ -253,6 +255,9 @@ Options:
 --inventory PATH      Inventory CSV (default: inventory.csv)
 --strategy [A|B|C]    Test handling strategy; prompted when omitted
 --stale [keep|remove] Strategy C source-test policy; ignored for A/B
+--create-missing-tags Strategy C: create/reuse target tags and attach them to tests
+--create-missing-alerts
+                       Strategy C: create/reuse target alert rules and attach them to tests
 --timeout SECONDS     Destination validation window (default: 180)
 --parallel INTEGER    Parallel agent connections per batch, 1-5 (default: 1)
 --output DIR          Artifact directory (default: ./reports)
@@ -277,27 +282,78 @@ The source agent is still deleted.
 
 The tool creates an enabled target-owned equivalent with the exact original name, associates it with
 each migrated target agent that was assigned to the source test, preserves type-specific settings,
-and removes source labels/tags and alert rules. An existing target test with the same migrated name
-and type is updated, enabled, and reused on a rerun instead of being duplicated. Names never gain
-an `(MT)` or other migration suffix, including across round trips. Unknown or
-unsupported API v7 test types are reported without failing the run.
+and, by default, removes source labels/tags and alert rules. An existing target test with the same
+migrated name and type is updated, enabled, and reused on a rerun instead of being duplicated. Names
+never gain an `(MT)` or other migration suffix, including across round trips. Unknown or unsupported
+API v7 test types are reported without failing the run.
+
+Tag and alert-rule migration is independently opt-in:
+
+- No resource flags: create the test without tags or alert rules and set `alertsEnabled=false`.
+- `--create-missing-tags`: reuse semantically matching target tags or create missing static test
+  tags, then attach the target tag UUIDs to the migrated test.
+- `--create-missing-alerts`: reuse semantically matching target alert rules or create missing
+  rules, then attach the target rule IDs to the migrated test. `alertsEnabled` preserves the source
+  value when at least one rule is attached; otherwise it remains false so target defaults are not
+  applied accidentally.
+- Both flags: reconcile and attach both resource classes.
+
+The flags apply only to Strategy C. They are accepted but recorded as `not-applicable` for
+Strategies A and B. Source IDs are never copied because tag and alert-rule identifiers are scoped to
+their account group.
 
 Strategy C snapshots every source test before the first agent changes account groups. A test with
-no source-agent association is recreated without tags or alert rules, enabled, and assigned to all
-successfully migrated inventory agents. If a test references a source agent outside the selected
-inventory, the run stops before destructive work rather than producing an incomplete copy.
+no source-agent association is recreated using the selected resource flags, enabled, and assigned
+to all successfully migrated inventory agents only when its API v7 type is agent-based. If a test
+references a source agent outside the selected inventory, the run stops before destructive work
+rather than producing an incomplete copy.
 
-For both newly created and reused tests, the tool sends the agent assignment explicitly and then
-polls API v7 until the target test is visibly enabled and associated with that exact target agent.
-The source agent is not deleted until this verification succeeds.
+BGP tests are handled separately because API v7 defines them as prefix-and-monitor resources, not
+Enterprise Agent resources. Strategy C recreates each BGP test exactly once with its exact original
+name, prefix, `usePublicBgp` setting, and monitor IDs; it never adds an `agents` field or calls the
+agent-assignment endpoint for BGP. Before the first agent move, every selected source monitor ID must
+be visible in the destination account group or the run stops. After recreation, the tool verifies
+that the target BGP test is enabled, has no agent associations, and has the exact expected name,
+prefix, public-BGP setting, and monitor set. A `--stale remove` BGP source test becomes eligible for
+deletion only after that readiness check succeeds. Dry-run reports this as
+`recreate-monitor-based`, never `recreate-and-assign-all`.
+
+Associations with Cloud Agents are preserved when the same Cloud Agent ID is visible in the
+destination account group. A source-only Cloud Agent, or any other agent outside the selected
+inventory that is not portable to the destination, still stops the run during preflight.
+
+Resource reconciliation is also a preflight gate before the first agent reset or token change:
+
+- In `--apply` mode, enabling either reconciliation flag moves the destructive-action confirmation
+  before the first tag or alert-rule creation, so no target resource is written before approval.
+- Resource creation is additive and idempotent. If one resource is created successfully and a later
+  preflight operation fails, the created resource may remain in the target; a retry detects and
+  reuses it instead of creating a duplicate.
+- Tags are matched by `objectType`, `type`, `key`, and `value`. Strategy C supports only
+  `objectType=test`, `type=static` tags. Duplicate identities are treated as ambiguous. Missing
+  `system` or `partner` tags cannot be user-created and stop the run before agent migration.
+- Alert rules are matched by a canonical fingerprint of their API v7 create fields. A target rule
+  with the same `ruleName` and `alertType` but a different definition stops the run rather than
+  silently overwriting or duplicating it. A conflicting default rule for the same alert type also
+  stops preflight.
+- Alert notifications are copied as part of the rule definition. If they reference a notification
+  integration unavailable in the target account group, API v7 rejects the rule during preflight;
+  agents have not yet moved, and the operator can create/reconcile that dependency before retrying.
+
+For newly created and reused agent-based tests, the tool sends the agent assignment explicitly and
+then polls API v7 until the target test is visibly enabled and associated with that exact target
+agent. Monitor-based BGP tests instead use the exact-configuration readiness check described above.
+The source agent is not deleted until the applicable verification succeeds.
 
 Expanded GET responses are converted back to the API v7 create-request shape: read-only response
-fields are removed, agent and monitor identifiers are serialized as strings, and alerts are
-explicitly disabled so default alert rules are not attached.
+fields are removed, agent and monitor identifiers are serialized as strings, and account-local tag
+and alert-rule IDs are replaced by their reconciled target IDs. When alert reconciliation is not
+enabled, alerts are explicitly disabled so default alert rules are not attached.
 
 In dry-run mode, Option C records adapter support and the complete target test inventory. There is
 no target account-group licensing constraint; a test is reported as unsupported only when its API
-v7 test type has no implemented recreation adapter.
+v7 test type has no implemented recreation adapter. Resource flags perform read-only source/target
+reconciliation and report projected creates without creating tags, alert rules, or tests.
 
 ## Strategy C source-test policy
 
@@ -344,6 +400,9 @@ the CLI exits.
 - Existing `(MT)` tests are reused rather than duplicated.
 - Test sharing and assignments are additive; reused Strategy C tests retain prior migrated-agent
   associations, add the current migrated agent, and are forced enabled.
+- Strategy C tag/alert reconciliation is idempotent: reruns reuse exact semantic matches. Ambiguous
+  duplicates or same-name alert-rule conflicts stop before agent changes instead of selecting an
+  arbitrary resource.
 - Source-test removal for Strategy C is evaluated per test. A source test is removed only when all
   source agents listed on that test completed, so unrelated agent failures do not block cleanup.
 - Strategy A intentionally migrates agents without tests. A later Strategy C run cannot infer
@@ -382,5 +441,10 @@ Official references used for implementation:
 - <https://developer.cisco.com/docs/thousandeyes/assign-tests-to-an-agent/>
 - <https://developer.cisco.com/docs/thousandeyes/delete-enterprise-agent/>
 - <https://developer.cisco.com/docs/thousandeyes/delete-http-server-test/>
+- <https://developer.cisco.com/docs/thousandeyes/create-http-server-test/>
+- <https://developer.cisco.com/docs/thousandeyes/list-tags/>
+- <https://developer.cisco.com/docs/thousandeyes/create-tag/>
+- <https://developer.cisco.com/docs/thousandeyes/list-alert-rules/>
+- <https://developer.cisco.com/docs/thousandeyes/create-alert-rule/>
 - <https://developer.cisco.com/docs/thousandeyes/pagination/>
 - <https://docs.thousandeyes.com/product-documentation/enterprise-agents/resetting-an-enterprise-agent>

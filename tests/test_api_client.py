@@ -45,6 +45,32 @@ def test_agent_requests_are_scoped_and_parse_test_ids() -> None:
     assert agents[0].online
 
 
+def test_agent_inventory_can_include_cloud_and_enterprise_types() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["aid"] == "123"
+        assert request.url.params["agentTypes"] == "CLOUD,ENTERPRISE"
+        return httpx.Response(
+            200,
+            json={
+                "agents": [
+                    {
+                        "agentId": "320",
+                        "agentName": "Guadalajara, Mexico",
+                        "agentType": "cloud",
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    client = ThousandEyesApiClient("oauth", transport=httpx.MockTransport(handler))
+
+    agents = client.list_agents("123", agent_types="CLOUD,ENTERPRISE")
+
+    assert agents[0].agent_id == "320"
+    assert agents[0].agent_type == "cloud"
+
+
 def test_wait_for_agent_uses_full_180_second_window() -> None:
     clock = 0.0
     calls = 0
@@ -283,6 +309,65 @@ def test_wait_for_test_ready_requires_enabled_and_agent_association() -> None:
     assert clock == 10
 
 
+def test_wait_for_monitor_test_ready_requires_exact_configuration_without_agents() -> None:
+    clock = 0.0
+    calls = 0
+
+    def monotonic() -> float:
+        return clock
+
+    def sleep(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        ready = calls >= 2
+        return httpx.Response(
+            200,
+            json={
+                "test": {
+                    "testId": "123",
+                    "testName": "198.51.100.0/24",
+                    "type": "bgp",
+                    "prefix": "198.51.100.0/24",
+                    "enabled": ready,
+                    "usePublicBgp": True,
+                    "monitors": [
+                        {"monitorId": "3"},
+                        {"monitorId": "4"},
+                    ],
+                }
+            },
+            request=request,
+        )
+
+    client = ThousandEyesApiClient(
+        "oauth",
+        transport=httpx.MockTransport(handler),
+        retry_policy=RetryPolicy(attempts=1),
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+
+    test = client.wait_for_monitor_test_ready(
+        "target",
+        test_type="bgp",
+        test_id="123",
+        expected_name="198.51.100.0/24",
+        expected_prefix="198.51.100.0/24",
+        expected_use_public_bgp=True,
+        expected_monitor_ids={"3", "4"},
+        timeout_seconds=180,
+    )
+
+    assert test.enabled
+    assert test.agents == []
+    assert calls == 2
+    assert clock == 5
+
+
 def test_wait_for_deleted_test_absence() -> None:
     calls = 0
 
@@ -388,3 +473,61 @@ def test_hal_cursor_pagination_follows_links_next() -> None:
 
     assert [group.aid for group in groups] == ["1", "2"]
     assert "cursor=next" in calls[1]
+
+
+def test_tag_and_alert_rule_requests_are_scoped_to_account_group() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.params["aid"] == "target"
+        if request.method == "GET" and request.url.path == "/v7/tags":
+            return httpx.Response(
+                200,
+                json={"tags": [{"id": "tag-1", "key": "team", "value": "netops"}]},
+                request=request,
+            )
+        if request.method == "POST" and request.url.path == "/v7/tags":
+            assert json.loads(request.content)["objectType"] == "test"
+            return httpx.Response(
+                201,
+                json={"tag": {"id": "tag-2", "key": "team", "value": "platform"}},
+                request=request,
+            )
+        if request.method == "GET" and request.url.path == "/v7/alerts/rules":
+            return httpx.Response(
+                200,
+                json={"alertRules": [{"ruleId": "rule-1", "ruleName": "Latency"}]},
+                request=request,
+            )
+        if request.method == "POST" and request.url.path == "/v7/alerts/rules":
+            assert json.loads(request.content)["alertType"] == "http-server"
+            return httpx.Response(
+                201,
+                json={"alertRule": {"ruleId": "rule-2", "ruleName": "Loss"}},
+                request=request,
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url.path}")
+
+    client = ThousandEyesApiClient(
+        "oauth",
+        transport=httpx.MockTransport(handler),
+        retry_policy=RetryPolicy(attempts=1),
+    )
+
+    assert client.list_tags("target")[0]["id"] == "tag-1"
+    assert client.create_tag(
+        "target",
+        {"key": "team", "value": "platform", "objectType": "test", "type": "static"},
+    )["id"] == "tag-2"
+    assert client.list_alert_rules("target")[0]["ruleId"] == "rule-1"
+    assert client.create_alert_rule(
+        "target",
+        {
+            "ruleName": "Loss",
+            "expression": "loss > 5%",
+            "alertType": "http-server",
+            "roundsViolatingOutOf": 3,
+        },
+    )["ruleId"] == "rule-2"
+    assert len(requests) == 4

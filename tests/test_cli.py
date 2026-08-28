@@ -23,6 +23,8 @@ def test_cli_defaults_to_dry_run_180_seconds_and_one_connection() -> None:
     assert "--parallel" in result.output
     assert "default: 1" in result.output
     assert "Strategy C source-test policy; ignored for A/B" in result.output
+    assert "--create-missing-tags" in result.output
+    assert "--create-missing-alerts" in result.output
 
 
 def test_cli_rejects_parallelism_outside_one_to_five() -> None:

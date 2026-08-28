@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 
 from te_agent_migrate.api_client import ThousandEyesApiClient
-from te_agent_migrate.errors import ApiError, HardStop, HumanDecisionRequired, VisibilityTimeout
+from te_agent_migrate.errors import (
+    ApiError,
+    HardStop,
+    HumanDecisionRequired,
+    UiError,
+    VisibilityTimeout,
+)
 from te_agent_migrate.models import (
     AccountGroup,
     AgentRecord,
@@ -109,16 +115,33 @@ class FakeApi:
         self.deleted_tests: list[tuple[str, str, str]] = []
         self.renamed: list[tuple[str, str, str]] = []
         self.operation_order: list[str] = []
+        self.source_tags: list[dict[str, Any]] = []
+        self.target_tags: list[dict[str, Any]] = []
+        self.source_alert_rules: list[dict[str, Any]] = []
+        self.target_alert_rules: list[dict[str, Any]] = []
+        self.created_tags: list[dict[str, Any]] = []
+        self.created_alert_rules: list[dict[str, Any]] = []
+        self.source_cloud_agents: list[AgentRecord] = []
+        self.target_cloud_agents: list[AgentRecord] = []
+        self.source_monitors: list[dict[str, Any]] = []
+        self.target_monitors: list[dict[str, Any]] = []
         self.collision = AgentRecord(
             "300", "agent-a", "old-agent", ["192.0.2.99"], "offline", "target"
         )
 
-    def list_agents(self, aid: str) -> list[AgentRecord]:
+    def list_agents(
+        self, aid: str, *, agent_types: str = "ENTERPRISE"
+    ) -> list[AgentRecord]:
         if aid == "source":
-            return [] if self.source_deleted else [self.source]
+            agents = [] if self.source_deleted else [self.source]
+            if "CLOUD" in agent_types:
+                agents.extend(self.source_cloud_agents)
+            return agents
         self.target_list_calls += 1
         visible = self.target_existing or (self.target_on_recheck and self.target_list_calls > 1)
         agents = [self.target] if visible else []
+        if "CLOUD" in agent_types:
+            agents.extend(self.target_cloud_agents)
         if self.target_name_collision:
             agents.append(self.collision)
         return agents
@@ -140,7 +163,7 @@ class FakeApi:
             test_type,
             aid,
             bool(payload["enabled"]),
-            agents=list(payload["agents"]),
+            agents=list(payload.get("agents", [])),
             raw=dict(payload),
         )
         self.target_tests.append(created)
@@ -155,7 +178,7 @@ class FakeApi:
             test_type,
             aid,
             bool(payload["enabled"]),
-            agents=list(payload["agents"]),
+            agents=list(payload.get("agents", [])),
             raw=dict(payload),
         )
         self.target_tests = [
@@ -219,10 +242,57 @@ class FakeApi:
         self.deleted_tests.append((aid, test_type, test_id))
         self.source_tests = [test for test in self.source_tests if test.test_id != test_id]
 
+    def wait_for_monitor_test_ready(self, aid: str, **kwargs: Any) -> TeTestRecord:
+        self.operation_order.append("wait_monitor_test_ready")
+        test = next(
+            test for test in self.target_tests if test.test_id == kwargs["test_id"]
+        )
+        assert aid == "target"
+        assert test.enabled
+        assert test.name == kwargs["expected_name"]
+        assert str(test.raw.get("prefix", "")) == kwargs["expected_prefix"]
+        assert bool(test.raw.get("usePublicBgp", False)) is kwargs[
+            "expected_use_public_bgp"
+        ]
+        actual_monitors = {
+            str(
+                monitor.get("monitorId", monitor.get("id"))
+                if isinstance(monitor, dict)
+                else monitor
+            )
+            for monitor in test.raw.get("monitors", [])
+        }
+        assert actual_monitors == kwargs["expected_monitor_ids"]
+        assert test.agents == []
+        return test
+
     def wait_for_test_absent(self, aid: str, **kwargs: Any) -> None:
         self.operation_order.append("wait_test_absent")
         tests = self.source_tests if aid == "source" else self.target_tests
         assert all(test.test_id != kwargs["test_id"] for test in tests)
+
+    def list_tags(self, aid: str) -> list[dict[str, Any]]:
+        return list(self.source_tags if aid == "source" else self.target_tags)
+
+    def list_monitors(self, aid: str) -> list[dict[str, Any]]:
+        return list(self.source_monitors if aid == "source" else self.target_monitors)
+
+    def create_tag(self, _aid: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.operation_order.append("create_tag")
+        self.created_tags.append(payload)
+        created = {**payload, "id": "target-tag"}
+        return created
+
+    def list_alert_rules(self, aid: str) -> list[dict[str, Any]]:
+        return list(
+            self.source_alert_rules if aid == "source" else self.target_alert_rules
+        )
+
+    def create_alert_rule(self, _aid: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.operation_order.append("create_alert_rule")
+        self.created_alert_rules.append(payload)
+        created = {**payload, "ruleId": "target-rule"}
+        return created
 
 
 class FakeUi:
@@ -265,6 +335,8 @@ def runner(
     strategy: Strategy = Strategy.AGENTS_ONLY,
     stale_policy: StalePolicy = StalePolicy.KEEP,
     parallelism: int = 1,
+    create_missing_tags: bool = False,
+    create_missing_alerts: bool = False,
 ) -> MigrationRunner:
     return MigrationRunner(
         api=api,  # type: ignore[arg-type]
@@ -272,7 +344,14 @@ def runner(
         report=RunReport(tmp_path, mode.value),
         prompter=prompter,  # type: ignore[arg-type]
         console=FakeConsole(),  # type: ignore[arg-type]
-        options=RunOptions(mode, strategy, stale_policy, parallelism=parallelism),
+        options=RunOptions(
+            mode,
+            strategy,
+            stale_policy,
+            parallelism=parallelism,
+            create_missing_tags=create_missing_tags,
+            create_missing_alerts=create_missing_alerts,
+        ),
         source_group=AccountGroup("source", "Source"),
         target_group=AccountGroup("target", "Target"),
         target_account_token="A" * 32,
@@ -490,6 +569,122 @@ def assigned_source_test() -> TeTestRecord:
     )
 
 
+def tagged_alerted_source_test() -> TeTestRecord:
+    test = assigned_source_test()
+    test.raw["tags"] = [{"id": "source-tag"}]
+    test.raw["alertRules"] = [{"ruleId": "source-rule"}]
+    test.alert_rules = list(test.raw["alertRules"])
+    return test
+
+
+def test_strategy_c_reconciles_resources_before_test_creation(tmp_path: Path) -> None:
+    api = FakeApi(source_tests=[tagged_alerted_source_test()])
+    prompter = FakePrompter()
+    api.source_tags = [
+        {
+            "id": "source-tag",
+            "key": "team",
+            "value": "netops",
+            "objectType": "test",
+            "type": "static",
+        }
+    ]
+    api.source_alert_rules = [
+        {
+            "ruleId": "source-rule",
+            "ruleName": "High latency",
+            "expression": "responseTime > 1000",
+            "alertType": "http-server",
+            "roundsViolatingOutOf": 3,
+        }
+    ]
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=[],
+        prompter=prompter,
+        strategy=Strategy.RECREATE,
+        create_missing_tags=True,
+        create_missing_alerts=True,
+    )
+    inventory = [InventoryAgent("agent-a", "192.0.2.10")]
+
+    migration._prepare_strategy_c_source_test_inventory(inventory)
+    migration._handle_tests(
+        api.source_tests,
+        api.target,
+        "correlation",
+        inventory[0],
+        source_agent_id=api.source.agent_id,
+    )
+
+    assert prompter.confirm_calls == 1
+    assert api.operation_order[:3] == ["create_tag", "create_alert_rule", "create_test"]
+    assert api.target_tests[0].raw["tags"] == ["target-tag"]
+    assert api.target_tests[0].raw["alertRules"] == ["target-rule"]
+    assert api.target_tests[0].raw["alertsEnabled"] is True
+    assert migration.report.metadata["strategy_c_tags_created"] == 1
+    assert migration.report.metadata["strategy_c_alert_rules_created"] == 1
+
+
+def test_strategy_c_preserves_target_visible_cloud_agent_association(
+    tmp_path: Path,
+) -> None:
+    source_test = assigned_source_test()
+    source_test.agents.append({"agentId": "320", "agentType": "cloud"})
+    source_test.raw["agents"] = list(source_test.agents)
+    api = FakeApi(source_tests=[source_test])
+    api.source_cloud_agents = [
+        AgentRecord(
+            "320",
+            "Guadalajara, Mexico",
+            None,
+            [],
+            "unknown",
+            "source",
+            agent_type="cloud",
+        )
+    ]
+    api.target_cloud_agents = [
+        AgentRecord(
+            "320",
+            "Guadalajara, Mexico",
+            None,
+            [],
+            "unknown",
+            "target",
+            agent_type="cloud",
+        )
+    ]
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=[],
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+    )
+    inventory = [InventoryAgent("agent-a", "192.0.2.10")]
+
+    migration._prepare_strategy_c_source_test_inventory(inventory)
+    migration._handle_tests(
+        api.source_tests,
+        api.target,
+        "correlation",
+        inventory[0],
+        source_agent_id=api.source.agent_id,
+    )
+
+    assert {str(agent["agentId"]) for agent in api.target_tests[0].agents} == {
+        "200",
+        "320",
+    }
+    assert migration.report.metadata[
+        "strategy_c_preserved_cloud_agent_association_count"
+    ] == 1
+
+
 def unassigned_source_test() -> TeTestRecord:
     raw = {
         "testId": 11,
@@ -508,6 +703,28 @@ def unassigned_source_test() -> TeTestRecord:
         False,
         agents=[],
         alert_rules=raw["alerts"],
+        raw=raw,
+    )
+
+
+def bgp_source_test() -> TeTestRecord:
+    raw = {
+        "testId": 12,
+        "type": "bgp",
+        "testName": "198.51.100.0/24",
+        "prefix": "198.51.100.0/24",
+        "enabled": False,
+        "alertsEnabled": True,
+        "usePublicBgp": True,
+        "monitors": [{"monitorId": "3"}, {"monitorId": "4"}],
+    }
+    return TeTestRecord(
+        "12",
+        "198.51.100.0/24",
+        "bgp",
+        "source",
+        False,
+        agents=[],
         raw=raw,
     )
 
@@ -549,6 +766,131 @@ def test_strategy_c_unassigned_test_is_enabled_and_assigned_to_every_target(
     assert migrated.raw["alertsEnabled"] is False
 
 
+def test_strategy_c_classifies_bgp_as_monitor_based_not_assign_all(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi(source_tests=[bgp_source_test()])
+    api.target_monitors = [{"monitorId": "3"}, {"monitorId": "4"}]
+    migration = runner(
+        tmp_path,
+        mode=Mode.DRY_RUN,
+        api=api,
+        calls=[],
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+        stale_policy=StalePolicy.REMOVE,
+    )
+
+    migration._prepare_strategy_c_source_test_inventory(
+        [InventoryAgent("agent-a", "192.0.2.10")]
+    )
+
+    assert migration._strategy_c_unassigned_tests == []
+    assert [test.test_id for test in migration._strategy_c_monitor_tests] == ["12"]
+
+
+def test_strategy_c_stops_before_agent_moves_when_bgp_monitor_is_missing(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi(source_tests=[bgp_source_test()])
+    api.target_monitors = [{"monitorId": "3"}]
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=[],
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+        stale_policy=StalePolicy.REMOVE,
+    )
+
+    with pytest.raises(HardStop, match="monitor IDs are unavailable"):
+        migration._prepare_strategy_c_source_test_inventory(
+            [InventoryAgent("agent-a", "192.0.2.10")]
+        )
+
+    assert "delete_agent" not in api.operation_order
+    assert "delete_test" not in api.operation_order
+
+
+def test_strategy_c_bgp_is_created_once_without_agents_and_cleaned_after_readiness(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi(source_tests=[bgp_source_test()])
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=[],
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+        stale_policy=StalePolicy.REMOVE,
+    )
+    inventory = [
+        InventoryAgent("agent-a", "192.0.2.10"),
+        InventoryAgent("agent-b", "192.0.2.11"),
+    ]
+    targets = [
+        AgentRecord("201", "agent-a", "agent-a", ["192.0.2.10"], "online", "target"),
+        AgentRecord("202", "agent-b", "agent-b", ["192.0.2.11"], "online", "target"),
+    ]
+    migration._strategy_c_monitor_tests = [api.source_tests[0]]
+    migration._completed_target_agents = {
+        item.hostname: (item, target) for item, target in zip(inventory, targets, strict=True)
+    }
+
+    migration._handle_strategy_c_monitor_tests(inventory)
+
+    assert len(api.target_tests) == 1
+    migrated = api.target_tests[0]
+    assert migrated.enabled
+    assert migrated.agents == []
+    assert migrated.raw["monitors"] == ["3", "4"]
+    assert api.operation_order.count("create_test") == 1
+    assert "assign_tests" not in api.operation_order
+    assert "wait_monitor_test_ready" in api.operation_order
+
+    migration._cleanup_source_tests()
+
+    assert api.deleted_tests == [("source", "bgp", "12")]
+    assert api.operation_order.index("wait_monitor_test_ready") < api.operation_order.index(
+        "delete_test"
+    )
+
+
+def test_strategy_c_bgp_dry_run_reports_monitor_based_action(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi(source_tests=[bgp_source_test()])
+    migration = runner(
+        tmp_path,
+        mode=Mode.DRY_RUN,
+        api=api,
+        calls=[],
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+        stale_policy=StalePolicy.REMOVE,
+    )
+    inventory_agent = InventoryAgent("agent-a", "192.0.2.10")
+    target = AgentRecord(
+        "201", "agent-a", "agent-a", ["192.0.2.10"], "online", "target"
+    )
+    migration._strategy_c_monitor_tests = [api.source_tests[0]]
+    migration._completed_target_agents = {
+        inventory_agent.hostname: (inventory_agent, target)
+    }
+
+    migration._handle_strategy_c_monitor_tests([inventory_agent])
+
+    projected = next(
+        row for row in migration.report.tests if row.get("original_test_id") == "12"
+    )
+    assert projected["action"] == "recreate-monitor-based"
+    assert projected["target_agent_id"] is None
+    assert projected["monitor_count"] == 2
+    assert api.target_tests == []
+
+
 def test_apply_deletes_source_then_restores_exact_name(tmp_path: Path) -> None:
     calls: list[str] = []
     api = FakeApi()
@@ -578,6 +920,50 @@ def test_apply_deletes_source_then_restores_exact_name(tmp_path: Path) -> None:
     assert api.operation_order.index("target_online") < api.operation_order.index("delete_agent")
     assert api.operation_order.index("delete_agent") < api.operation_order.index("wait_absent")
     assert api.operation_order.index("wait_absent") < api.operation_order.index("rename")
+
+
+def test_dry_run_recheck_retries_agent_without_requiring_target_online(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    api = FakeApi(target_existing=False)
+    prompter = FakePrompter(decision="recheck")
+    migration = runner(
+        tmp_path,
+        mode=Mode.DRY_RUN,
+        api=api,
+        calls=calls,
+        prompter=prompter,
+    )
+    original_run_agent = migration._run_agent
+    attempts = 0
+
+    def fail_once(agent: InventoryAgent, correlation_id: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise UiError("temporary UI connection failure")
+        original_run_agent(agent, correlation_id)
+
+    monkeypatch.setattr(migration, "_run_agent", fail_once)
+
+    migration.run([InventoryAgent("agent-a", "192.0.2.10")])
+
+    assert attempts == 2
+    assert prompter.failure_calls == 1
+    assert api.target_existing is False
+    recheck = next(
+        step for step in migration.report.steps if step["step"] == "read_only_recheck"
+    )
+    assert recheck["status"] == "ok"
+    assert "target_online=not-required-in-dry-run" in recheck["detail"]
+    assert migration._recap == [
+        {
+            "agent": "agent-a",
+            "status": "ok",
+            "detail": "dry-run retry succeeded after read-only recheck",
+        }
+    ]
 
 
 def test_existing_target_recovery_deletes_source_without_reset(tmp_path: Path) -> None:

@@ -94,6 +94,28 @@ def test_codex_sandbox_network_failure_has_actionable_https_message(
         client.authenticate()
 
 
+def test_codex_network_override_reports_actual_no_route_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+    monkeypatch.setenv("TE_ALLOW_CODEX_SANDBOX_NETWORK", "1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        os_error = OSError(errno.EHOSTUNREACH, "No route to host")
+        raise httpx.ConnectError(str(os_error), request=request) from os_error
+
+    client = TevaUiClient(
+        "192.0.2.10",
+        "admin",
+        "password",
+        transport=httpx.MockTransport(handler),
+        retry_policy=RetryPolicy(attempts=1),
+    )
+
+    with pytest.raises(UiError, match=r"HTTPS/443: no route to host"):
+        client.authenticate()
+
+
 def test_no_route_error_identifies_direct_transport_and_macos_permission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -140,8 +140,10 @@ class ThousandEyesApiClient:
             for item in self._paginate("account-groups", preferred_key="accountGroups")
         ]
 
-    def list_agents(self, aid: str) -> list[AgentRecord]:
-        params = {"agentTypes": "ENTERPRISE", "expand": "test-ids"}
+    def list_agents(
+        self, aid: str, *, agent_types: str = "ENTERPRISE"
+    ) -> list[AgentRecord]:
+        params = {"agentTypes": agent_types, "expand": "test-ids"}
         return [
             AgentRecord.from_api(item, aid)
             for item in self._paginate("agents", preferred_key="agents", aid=aid, params=params)
@@ -264,6 +266,56 @@ class ThousandEyesApiClient:
             for item in self._paginate("tests", preferred_key="tests", aid=aid)
         ]
 
+    def list_tags(self, aid: str) -> list[dict[str, Any]]:
+        """List tags visible in one account group."""
+        return list(self._paginate("tags", preferred_key="tags", aid=aid))
+
+    def list_monitors(self, aid: str) -> list[dict[str, Any]]:
+        """List BGP monitors visible in one account group."""
+        return list(self._paginate("monitors", preferred_key="monitors", aid=aid))
+
+    def create_tag(self, aid: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create one tag and return its API representation."""
+        response = self.request(
+            "POST",
+            "tags",
+            aid=aid,
+            json_body=payload,
+            expected={200, 201},
+            safe_to_retry=False,
+        )
+        values = self._items(response, "tags") if isinstance(response.get("tags"), list) else []
+        raw = values[0] if values else response.get("tag", response)
+        if not isinstance(raw, dict):
+            raise ApiError("Created tag response had an unexpected shape")
+        return raw
+
+    def list_alert_rules(self, aid: str) -> list[dict[str, Any]]:
+        """List alert rules visible in one account group."""
+        return list(
+            self._paginate("alerts/rules", preferred_key="alertRules", aid=aid)
+        )
+
+    def create_alert_rule(self, aid: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Create one alert rule and return its API representation."""
+        response = self.request(
+            "POST",
+            "alerts/rules",
+            aid=aid,
+            json_body=payload,
+            expected={200, 201},
+            safe_to_retry=False,
+        )
+        values = (
+            self._items(response, "alertRules")
+            if isinstance(response.get("alertRules"), list)
+            else []
+        )
+        raw = values[0] if values else response.get("alertRule", response)
+        if not isinstance(raw, dict):
+            raise ApiError("Created alert-rule response had an unexpected shape")
+        return raw
+
     def get_test(self, aid: str, test_type: str, test_id: str) -> TestRecord:
         payload = self.request(
             "GET",
@@ -350,6 +402,65 @@ class ThousandEyesApiClient:
                 raise VisibilityTimeout(
                     f"Target test {test_id} was not enabled and assigned to agent {agent_id} "
                     f"within {timeout_seconds} seconds"
+                )
+            self._sleep(min(poll_interval_seconds, remaining))
+
+    @staticmethod
+    def _test_monitor_ids(test: TestRecord) -> set[str]:
+        monitor_ids: set[str] = set()
+        raw_monitors = test.raw.get("monitors", [])
+        if not isinstance(raw_monitors, list):
+            return monitor_ids
+        for monitor in raw_monitors:
+            value = (
+                monitor.get("monitorId", monitor.get("id"))
+                if isinstance(monitor, dict)
+                else monitor
+            )
+            if value is not None and str(value):
+                monitor_ids.add(str(value))
+        return monitor_ids
+
+    def wait_for_monitor_test_ready(
+        self,
+        aid: str,
+        *,
+        test_type: str,
+        test_id: str,
+        expected_name: str,
+        expected_prefix: str,
+        expected_use_public_bgp: bool,
+        expected_monitor_ids: set[str],
+        timeout_seconds: int,
+        poll_interval_seconds: float = 5.0,
+        on_poll: Callable[[int, float], None] | None = None,
+    ) -> TestRecord:
+        """Wait for an enabled monitor-based test with an exact preserved configuration."""
+        deadline = self._monotonic() + timeout_seconds
+        poll_number = 0
+        while True:
+            poll_number += 1
+            remaining = max(0.0, deadline - self._monotonic())
+            if on_poll is not None:
+                on_poll(poll_number, remaining)
+            test = self.get_test(aid, test_type, test_id)
+            ready = (
+                test.enabled
+                and test.name == expected_name
+                and str(test.raw.get("prefix", "")) == expected_prefix
+                and bool(test.raw.get("usePublicBgp", False))
+                is expected_use_public_bgp
+                and self._test_monitor_ids(test) == expected_monitor_ids
+                and not self._test_agent_ids(test)
+            )
+            if ready:
+                return test
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                raise VisibilityTimeout(
+                    f"Target monitor-based test {test_id} did not become enabled with its "
+                    f"exact name, prefix, monitor set, and no agent associations within "
+                    f"{timeout_seconds} seconds"
                 )
             self._sleep(min(poll_interval_seconds, remaining))
 
