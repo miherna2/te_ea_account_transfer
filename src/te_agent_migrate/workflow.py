@@ -337,6 +337,25 @@ class MigrationRunner:
             "batch may have completed"
         )
 
+    @staticmethod
+    def _matching_source_identities(
+        agents: list[AgentRecord],
+        inventory_agent: InventoryAgent,
+    ) -> list[AgentRecord]:
+        """Return every source identity for one appliance without broad name collisions."""
+        ip_matches = [
+            agent for agent in agents if inventory_agent.ip_address in agent.ip_addresses
+        ]
+        if ip_matches:
+            return ip_matches
+        expected_name = inventory_agent.hostname.casefold()
+        return [
+            agent
+            for agent in agents
+            if (agent.hostname or "").casefold() == expected_name
+            or agent.name.casefold() == expected_name
+        ]
+
     def _pause_after_failure(
         self, inventory_agent: InventoryAgent, error: Exception, correlation_id: str
     ) -> bool:
@@ -414,8 +433,12 @@ class MigrationRunner:
         with self.step(correlation_id, inventory_agent.hostname, "api_prevalidation"):
             source_agents = self.api.list_agents(self.source_group.aid)
             target_agents = self.api.list_agents(self.target_group.aid)
-            source = self.api.match_agent(
+            source_identities = self._matching_source_identities(
                 source_agents,
+                inventory_agent,
+            )
+            source = self.api.match_agent(
+                source_identities,
                 hostname=inventory_agent.hostname,
                 ip_address=inventory_agent.ip_address,
             )
@@ -434,11 +457,30 @@ class MigrationRunner:
                 raise HumanDecisionRequired(
                     f"No source or target API identity matched {inventory_agent.ip_address}"
                 )
-            tests = self._source_tests(source)
+            tests = self._source_tests(source_identities)
             self._record_agent("pre", inventory_agent, source)
             self._record_agent("existing-target", inventory_agent, target)
             for test in tests:
                 self.report.add_test(self._test_row("pre", test, source))
+
+        if len(source_identities) > 1:
+            self._event(
+                correlation_id,
+                inventory_agent.hostname,
+                "duplicate_source_identity_recovery",
+                StepStatus.OK,
+                (
+                    f"Detected {len(source_identities)} matching source identities; "
+                    "test associations will be merged and every source identity will be removed "
+                    "only after the destination identity is online"
+                ),
+                {
+                    "source_agent_ids": [agent.agent_id for agent in source_identities],
+                    "test_bearing_source_agent_ids": [
+                        agent.agent_id for agent in source_identities if agent.test_ids
+                    ],
+                },
+            )
 
         if source is not None and source.online and target is not None:
             self._event(
@@ -491,7 +533,13 @@ class MigrationRunner:
                         browserbot=browserbot,
                         crash_reports=crash_reports,
                     )
-                target = self._wait_for_target(inventory_agent, correlation_id)
+                target = self._wait_for_target(
+                    inventory_agent,
+                    correlation_id,
+                    prior_source_agent_ids={
+                        agent.agent_id for agent in source_identities
+                    },
+                )
             else:
                 self._event(
                     correlation_id,
@@ -511,12 +559,18 @@ class MigrationRunner:
                 inventory_agent,
                 source_agent_id=source.agent_id if source is not None else None,
             )
-            if source is not None:
+            if source_identities:
                 target = self._finalize_agent_migration(
-                    source, target, inventory_agent, correlation_id
+                    source_identities,
+                    target,
+                    inventory_agent,
+                    correlation_id,
                 )
                 with self._test_lock:
-                    self._completed_source_agent_ids.add(source.agent_id)
+                    self._completed_source_agent_ids.update(
+                        agent.agent_id for agent in source_identities
+                    )
+                assert source is not None
                 self._verify_identity_metadata(source, target, correlation_id, inventory_agent)
             else:
                 target = self._enforce_exact_target_name(target, inventory_agent, correlation_id)
@@ -527,7 +581,13 @@ class MigrationRunner:
                 )
             self._record_agent("post", inventory_agent, target)
 
-    def _wait_for_target(self, inventory_agent: InventoryAgent, correlation_id: str) -> AgentRecord:
+    def _wait_for_target(
+        self,
+        inventory_agent: InventoryAgent,
+        correlation_id: str,
+        *,
+        prior_source_agent_ids: set[str],
+    ) -> AgentRecord:
         try:
             with self.step(
                 correlation_id,
@@ -545,6 +605,10 @@ class MigrationRunner:
                     on_poll=lambda attempt, remaining: self.console.info(
                         inventory_agent.hostname,
                         (f"destination API poll {attempt}; {remaining:.0f}s remaining"),
+                    ),
+                    on_not_visible=lambda: self._require_no_new_online_source_identity(
+                        inventory_agent,
+                        prior_source_agent_ids,
                     ),
                 )
         except VisibilityTimeout as exc:
@@ -590,6 +654,30 @@ class MigrationRunner:
                     "no rollback or reset was attempted"
                 ) from exc
 
+    def _require_no_new_online_source_identity(
+        self,
+        inventory_agent: InventoryAgent,
+        prior_source_agent_ids: set[str],
+    ) -> None:
+        source_identities = self._matching_source_identities(
+            self.api.list_agents(self.source_group.aid),
+            inventory_agent,
+        )
+        unexpected = [
+            agent
+            for agent in source_identities
+            if agent.online and agent.agent_id not in prior_source_agent_ids
+        ]
+        if not unexpected:
+            return
+        unexpected_ids = ", ".join(agent.agent_id for agent in unexpected)
+        raise HardStop(
+            "A new online source identity appeared after the destination token was submitted "
+            f"(source aid={self.source_group.aid}, agent ids={unexpected_ids}). The configured "
+            "target account-group token registered the appliance in the wrong account group; "
+            "the destination wait was stopped without deleting source agents or tests"
+        )
+
     def _require_target_name_available(
         self,
         target_agents: list[AgentRecord],
@@ -613,67 +701,76 @@ class MigrationRunner:
 
     def _finalize_agent_migration(
         self,
-        source: AgentRecord,
+        source_identities: list[AgentRecord],
         target: AgentRecord,
         inventory_agent: InventoryAgent,
         correlation_id: str,
     ) -> AgentRecord:
         self._ensure_destructive_confirmation()
-        try:
-            with self.step(
-                correlation_id,
-                inventory_agent.hostname,
-                "api_source_delete",
-                start_detail=f"deleting source identity {source.agent_id}",
-            ):
-                self.api.delete_agent(self.source_group.aid, source.agent_id)
-            with self.step(
-                correlation_id,
-                inventory_agent.hostname,
-                "api_source_absent",
-                start_detail=(
-                    f"verifying source identity {source.agent_id} is absent for up to "
-                    f"{self.options.timeout_seconds} seconds"
-                ),
-            ):
-                self.api.wait_for_agent_absent(
-                    self.source_group.aid,
-                    agent_id=source.agent_id,
-                    timeout_seconds=self.options.timeout_seconds,
-                    on_poll=lambda attempt, remaining: self.console.info(
-                        inventory_agent.hostname,
-                        f"source-absence poll {attempt}; {remaining:.0f}s remaining",
-                    ),
-                )
-        except MigrationError as exc:
-            raise HardStop(
-                f"Source identity {source.agent_id} could not be deleted and confirmed absent "
-                f"after destination identity {target.agent_id} became online; "
-                f"{self._hard_stop_scope()}"
-            ) from exc
-
-        self.report.add_agent(
-            {
-                "phase": "source-removed",
-                "inventory_hostname": inventory_agent.hostname,
-                "ip_address": inventory_agent.ip_address,
-                "agent_id": source.agent_id,
-                "name": source.name,
-                "hostname": source.hostname,
-                "aid": source.aid,
-                "account_group": source.account_group_name,
-                "state": "removed",
-                "source_agent_removed": True,
-                "source_absent_confirmed": True,
-            }
+        ordered_identities = sorted(
+            {agent.agent_id: agent for agent in source_identities}.values(),
+            key=lambda agent: (
+                int(agent.agent_id) if agent.agent_id.isdigit() else -1,
+                agent.agent_id,
+            ),
         )
+        for source in ordered_identities:
+            try:
+                with self.step(
+                    correlation_id,
+                    inventory_agent.hostname,
+                    "api_source_delete",
+                    start_detail=f"deleting source identity {source.agent_id}",
+                ):
+                    self.api.delete_agent(self.source_group.aid, source.agent_id)
+                with self.step(
+                    correlation_id,
+                    inventory_agent.hostname,
+                    "api_source_absent",
+                    start_detail=(
+                        f"verifying source identity {source.agent_id} is absent for up to "
+                        f"{self.options.timeout_seconds} seconds"
+                    ),
+                ):
+                    self.api.wait_for_agent_absent(
+                        self.source_group.aid,
+                        agent_id=source.agent_id,
+                        timeout_seconds=self.options.timeout_seconds,
+                        on_poll=lambda attempt, remaining: self.console.info(
+                            inventory_agent.hostname,
+                            f"source-absence poll {attempt}; {remaining:.0f}s remaining",
+                        ),
+                    )
+            except MigrationError as exc:
+                raise HardStop(
+                    f"Source identity {source.agent_id} could not be deleted and confirmed absent "
+                    f"after destination identity {target.agent_id} became online; "
+                    f"{self._hard_stop_scope()}"
+                ) from exc
+
+            self.report.add_agent(
+                {
+                    "phase": "source-removed",
+                    "inventory_hostname": inventory_agent.hostname,
+                    "ip_address": inventory_agent.ip_address,
+                    "agent_id": source.agent_id,
+                    "name": source.name,
+                    "hostname": source.hostname,
+                    "aid": source.aid,
+                    "account_group": source.account_group_name,
+                    "state": "removed",
+                    "source_agent_removed": True,
+                    "source_absent_confirmed": True,
+                }
+            )
         target = self._enforce_exact_target_name(target, inventory_agent, correlation_id)
         self._event(
             correlation_id,
             inventory_agent.hostname,
             "migration_invariants",
             StepStatus.OK,
-            "source_agent_removed=True, source_absent_confirmed=True, "
+            f"source_identity_count={len(ordered_identities)}, source_agent_removed=True, "
+            "source_absent_confirmed=True, "
             "target_online=True, target_name_exact=True",
         )
         return target
@@ -847,17 +944,14 @@ class MigrationRunner:
                 for agent in source_agents
                 if agent.agent_type in {None, "enterprise"}
             ]
-            selected_source_agents = [
-                match
+            source_identity_groups = [
+                self._matching_source_identities(source_enterprise_agents, item)
                 for item in inventory
-                if (
-                    match := self.api.match_agent(
-                        source_enterprise_agents,
-                        hostname=item.hostname,
-                        ip_address=item.ip_address,
-                    )
-                )
-                is not None
+            ]
+            selected_source_agents = [
+                agent
+                for source_identities in source_identity_groups
+                for agent in source_identities
             ]
             summaries = self.api.list_tests(self.source_group.aid)
             details = [
@@ -927,7 +1021,7 @@ class MigrationRunner:
                     "Strategy C cannot safely recreate monitor-based tests because some "
                     f"source monitor IDs are unavailable in the target account group ({summary})"
                 )
-        all_inventory_agents_matched = len(selected_source_agents) == len(inventory)
+        all_inventory_agents_matched = all(source_identity_groups)
         if self._strategy_c_unassigned_tests and not all_inventory_agents_matched:
             raise HardStop(
                 "Strategy C found unassigned source tests but not every inventory agent exists "
@@ -1226,12 +1320,19 @@ class MigrationRunner:
             ),
         )
 
-    def _source_tests(self, source: AgentRecord | None) -> list[TestRecord]:
-        if source is None or not source.test_ids:
+    def _source_tests(self, source_identities: list[AgentRecord]) -> list[TestRecord]:
+        test_ids = list(
+            dict.fromkeys(
+                test_id
+                for source in source_identities
+                for test_id in source.test_ids
+            )
+        )
+        if not test_ids:
             return []
         if self.options.strategy.value == "C" and self._strategy_c_source_tests:
             snapshot_details: list[TestRecord] = []
-            for test_id in source.test_ids:
+            for test_id in test_ids:
                 test = self._strategy_c_source_tests.get(test_id)
                 if test is None:
                     self.report.add_unsupported_test(
@@ -1247,7 +1348,7 @@ class MigrationRunner:
             return snapshot_details
         summaries = {test.test_id: test for test in self.api.list_tests(self.source_group.aid)}
         details: list[TestRecord] = []
-        for test_id in source.test_ids:
+        for test_id in test_ids:
             summary = summaries.get(test_id)
             if summary is None:
                 self.report.add_unsupported_test(

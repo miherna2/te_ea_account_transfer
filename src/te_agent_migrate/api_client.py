@@ -178,6 +178,7 @@ class ThousandEyesApiClient:
         timeout_seconds: int,
         poll_interval_seconds: float = 5.0,
         on_poll: Callable[[int, float], None] | None = None,
+        on_not_visible: Callable[[], None] | None = None,
     ) -> AgentRecord:
         deadline = self._monotonic() + timeout_seconds
         poll_number = 0
@@ -191,6 +192,8 @@ class ThousandEyesApiClient:
             )
             if agent is not None:
                 return agent
+            if on_not_visible is not None:
+                on_not_visible()
             remaining = deadline - self._monotonic()
             if remaining <= 0:
                 raise VisibilityTimeout(

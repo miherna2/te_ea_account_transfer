@@ -394,6 +394,12 @@ the CLI exits.
 - A healthy existing target identity causes reset/token actions to be skipped.
 - Matching online identities in both groups enter recovery without another reset; the source agent
   is deleted after target test handling and its absence is verified.
+- Multiple source identities for the same appliance are grouped by exact inventory IP before a
+  hostname fallback. Their test associations are merged, and every matching source identity is
+  deleted and confirmed absent only after the destination identity and tests are ready.
+- After target-token submission, each destination poll also checks for a new online identity in the
+  source account group. Detecting one stops immediately with a wrong-account-group-token error
+  instead of waiting for the full visibility timeout or deleting source resources.
 - Existing suffixed target identities are repaired to the exact inventory hostname only after the
   corresponding source identity is deleted and confirmed absent.
 - A conflicting destination identity that already owns the exact name hard-stops before reset.

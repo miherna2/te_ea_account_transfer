@@ -88,6 +88,7 @@ class FakeApi:
         target_name_collision: bool = False,
         source_tests: list[TeTestRecord] | None = None,
         test_create_fails: bool = False,
+        wrong_group_registration: bool = False,
     ) -> None:
         self.source = AgentRecord("100", "agent-a", "agent-a", ["192.0.2.10"], "online", "source")
         self.target = AgentRecord(
@@ -101,12 +102,15 @@ class FakeApi:
         self.source_tests = source_tests or []
         self.target_tests: list[TeTestRecord] = []
         self.test_create_fails = test_create_fails
+        self.wrong_group_registration = wrong_group_registration
         self.source.test_ids = [
             test.test_id
             for test in self.source_tests
             if any(str(agent.get("agentId")) == self.source.agent_id for agent in test.agents)
         ]
+        self.source_aliases: list[AgentRecord] = []
         self.source_deleted = False
+        self.deleted_source_ids: set[str] = set()
         self.target_list_calls = 0
         self.wait_calls = 0
         self.wait_timeout: int | None = None
@@ -134,6 +138,11 @@ class FakeApi:
     ) -> list[AgentRecord]:
         if aid == "source":
             agents = [] if self.source_deleted else [self.source]
+            agents.extend(
+                agent
+                for agent in self.source_aliases
+                if agent.agent_id not in self.deleted_source_ids
+            )
             if "CLOUD" in agent_types:
                 agents.extend(self.source_cloud_agents)
             return agents
@@ -206,6 +215,19 @@ class FakeApi:
     def wait_for_agent(self, _aid: str, **kwargs: Any) -> AgentRecord:
         self.wait_calls += 1
         self.wait_timeout = kwargs["timeout_seconds"]
+        if self.wrong_group_registration:
+            self.source_aliases.append(
+                AgentRecord(
+                    "101",
+                    "agent-a-1665279",
+                    "agent-a",
+                    ["192.0.2.10"],
+                    "online",
+                    "source",
+                )
+            )
+            kwargs["on_not_visible"]()
+            raise AssertionError("Wrong-group registration guard did not stop the wait")
         if self.timeout:
             raise VisibilityTimeout("not visible within 180 seconds")
         self.target_existing = True
@@ -215,7 +237,7 @@ class FakeApi:
     def wait_for_agent_absent(self, _aid: str, **kwargs: Any) -> None:
         self.absence_wait_timeout = kwargs["timeout_seconds"]
         self.operation_order.append("wait_absent")
-        if not self.source_deleted:
+        if kwargs["agent_id"] not in self.deleted_source_ids:
             raise VisibilityTimeout("source remained visible")
 
     def update_agent_name(self, aid: str, agent_id: str, name: str) -> None:
@@ -235,7 +257,9 @@ class FakeApi:
         if self.source_delete_fails:
             raise ApiError("delete failed")
         self.deleted.append(agent_id)
-        self.source_deleted = True
+        self.deleted_source_ids.add(agent_id)
+        if agent_id == self.source.agent_id:
+            self.source_deleted = True
 
     def delete_test(self, aid: str, test_type: str, test_id: str) -> None:
         self.operation_order.append("delete_test")
@@ -985,6 +1009,80 @@ def test_existing_target_recovery_deletes_source_without_reset(tmp_path: Path) -
     assert api.absence_wait_timeout == 180
     assert api.renamed == [("target", "200", "agent-a")]
     assert any(step["step"] == "dual_online_detected" for step in migration.report.steps)
+
+
+def test_duplicate_source_recovery_merges_tests_and_removes_every_identity(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    api = FakeApi(source_tests=[assigned_source_test()])
+    api.source.state = "offline"
+    api.source_aliases = [
+        AgentRecord(
+            "101",
+            "agent-a-1665279",
+            "agent-a",
+            ["192.0.2.10"],
+            "online",
+            "source",
+        )
+    ]
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=calls,
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+        stale_policy=StalePolicy.REMOVE,
+    )
+
+    migration.run([InventoryAgent("agent-a", "192.0.2.10")])
+
+    assert "reset" in calls
+    assert "token" in calls
+    assert api.deleted == ["100", "101"]
+    assert api.deleted_tests == [("source", "http-server", "10")]
+    assert len(api.target_tests) == 1
+    assert api.target_tests[0].enabled
+    assert any(
+        str(agent.get("agentId")) == api.target.agent_id
+        for agent in api.target_tests[0].agents
+    )
+    recovery = next(
+        step
+        for step in migration.report.steps
+        if step["step"] == "duplicate_source_identity_recovery"
+    )
+    assert recovery["status"] == "ok"
+    assert recovery["data"]["source_agent_ids"] == ["100", "101"]
+    assert recovery["data"]["test_bearing_source_agent_ids"] == ["100"]
+
+
+def test_wrong_target_token_stops_when_new_source_identity_appears(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi(
+        source_tests=[assigned_source_test()],
+        wrong_group_registration=True,
+    )
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=[],
+        prompter=FakePrompter(),
+        strategy=Strategy.RECREATE,
+        stale_policy=StalePolicy.REMOVE,
+    )
+
+    with pytest.raises(HardStop, match="registered the appliance in the wrong account group"):
+        migration.run([InventoryAgent("agent-a", "192.0.2.10")])
+
+    assert api.deleted == []
+    assert api.deleted_tests == []
+    assert api.target_tests == []
+    assert api.source_tests[0].test_id == "10"
 
 
 def test_source_deletion_failure_hard_stops_without_renaming_or_next_agent(tmp_path: Path) -> None:
