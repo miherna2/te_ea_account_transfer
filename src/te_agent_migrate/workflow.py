@@ -144,7 +144,9 @@ class MigrationRunner:
         self._recap: list[dict[str, str]] = []
         self._confirmation_lock = RLock()
         self._prompt_lock = RLock()
+        self._state_lock = RLock()
         self._test_lock = RLock()
+        self._destructive_correlation_ids: set[str] = set()
 
     @contextmanager
     def step(
@@ -337,6 +339,16 @@ class MigrationRunner:
             "batch may have completed"
         )
 
+    def _mark_destructive_started(self, correlation_id: str) -> None:
+        with self._state_lock:
+            self._destructive_correlation_ids.add(correlation_id)
+
+    def _retry_is_safe(self, correlation_id: str) -> bool:
+        if self.options.mode is Mode.DRY_RUN:
+            return True
+        with self._state_lock:
+            return correlation_id not in self._destructive_correlation_ids
+
     @staticmethod
     def _matching_source_identities(
         agents: list[AgentRecord],
@@ -360,7 +372,8 @@ class MigrationRunner:
         self, inventory_agent: InventoryAgent, error: Exception, correlation_id: str
     ) -> bool:
         detail = str(error)
-        allow_recheck = not isinstance(error, ApiError)
+        retry_safe = self._retry_is_safe(correlation_id)
+        allow_recheck = not isinstance(error, ApiError) and retry_safe
         while True:
             decision = self.prompter.failure_decision(
                 inventory_agent.hostname,
@@ -393,9 +406,10 @@ class MigrationRunner:
                     if self.options.mode is Mode.DRY_RUN
                     else str(target is not None)
                 )
+                retry_safe = self._retry_is_safe(correlation_id)
                 detail = (
                     f"read-only recheck: ui_reachable={ui_reachable}, "
-                    f"target_online={target_detail}"
+                    f"target_online={target_detail}, retry_safe={retry_safe}"
                 )
             except MigrationError as exc:
                 detail = f"read-only recheck failed: {exc}"
@@ -406,18 +420,26 @@ class MigrationRunner:
                 StepStatus.OK if ui_reachable else StepStatus.PAUSED,
                 detail,
             )
-            if self.options.mode is Mode.DRY_RUN and ui_reachable:
+            if ui_reachable and retry_safe:
+                mode_name = self.options.mode.value.lower()
+                retry_step = (
+                    "dry_run_retry" if self.options.mode is Mode.DRY_RUN else "apply_retry"
+                )
                 try:
                     with self.step(
                         correlation_id,
                         inventory_agent.hostname,
-                        "dry_run_retry",
-                        start_detail="retrying all read-only checks after successful recheck",
+                        retry_step,
+                        start_detail=(
+                            "retrying agent from pre-destructive boundary after successful "
+                            "recheck"
+                        ),
                     ):
                         self._run_agent(inventory_agent, correlation_id)
                 except Exception as exc:
-                    detail = f"dry-run retry failed: {exc}"
-                    allow_recheck = not isinstance(exc, ApiError)
+                    detail = f"{mode_name} retry failed: {exc}"
+                    retry_safe = self._retry_is_safe(correlation_id)
+                    allow_recheck = not isinstance(exc, ApiError) and retry_safe
                     continue
                 for row in reversed(self._recap):
                     if (
@@ -425,7 +447,9 @@ class MigrationRunner:
                         and row.get("status") == "failed"
                     ):
                         row["status"] = "ok"
-                        row["detail"] = "dry-run retry succeeded after read-only recheck"
+                        row["detail"] = (
+                            f"{mode_name} retry succeeded after read-only recheck"
+                        )
                         break
                 return True
 
@@ -509,6 +533,7 @@ class MigrationRunner:
                 self._ensure_destructive_confirmation()
                 browserbot = boolean_from_snapshot(before, "browserbot", default=True)
                 crash_reports = boolean_from_snapshot(before, "crash_reports", default=True)
+                self._mark_destructive_started(correlation_id)
                 with self.step(correlation_id, inventory_agent.hostname, "ui_reset"):
                     ui.reset_agent()
                 if not ui.is_reachable():
@@ -552,6 +577,7 @@ class MigrationRunner:
             with self.step(correlation_id, inventory_agent.hostname, "local_snapshot_post"):
                 after = ui.snapshot_state()
             self._record_diff(inventory_agent, before, after)
+            self._mark_destructive_started(correlation_id)
             self._handle_tests(
                 tests,
                 target,

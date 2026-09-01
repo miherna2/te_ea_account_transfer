@@ -53,9 +53,11 @@ class FakePrompter:
         self,
         decision: str = "abort",
         *,
+        decisions: list[str] | None = None,
         continue_batches: list[bool] | None = None,
     ) -> None:
         self.decision = decision
+        self.decisions = decisions or []
         self.continue_batches = continue_batches or []
         self.confirm_calls = 0
         self.failure_calls = 0
@@ -75,6 +77,8 @@ class FakePrompter:
     def failure_decision(self, _agent: str, _detail: str, *, allow_recheck: bool = True) -> str:
         self.failure_calls += 1
         self.failure_recheck_options.append(allow_recheck)
+        if self.decisions:
+            return self.decisions.pop(0)
         return self.decision
 
 
@@ -991,6 +995,85 @@ def test_dry_run_recheck_retries_agent_without_requiring_target_online(
             "detail": "dry-run retry succeeded after read-only recheck",
         }
     ]
+
+
+def test_apply_recheck_retries_pre_destructive_ui_failure_without_target_online(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    api = FakeApi(target_existing=False)
+    prompter = FakePrompter(decisions=["recheck", "abort"])
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=api,
+        calls=calls,
+        prompter=prompter,
+    )
+    authentication_attempts = 0
+
+    class FlakyAuthenticationUi(FakeUi):
+        def authenticate(self) -> None:
+            nonlocal authentication_attempts
+            authentication_attempts += 1
+            self.calls.append("authenticate")
+            if authentication_attempts == 1:
+                raise UiError("temporary UI connection failure")
+
+    migration.ui_factory = lambda _item: FlakyAuthenticationUi(calls)  # type: ignore[assignment]
+
+    migration.run([InventoryAgent("agent-a", "192.0.2.10")])
+
+    assert authentication_attempts == 3
+    assert prompter.failure_calls == 1
+    assert prompter.failure_recheck_options == [True]
+    assert calls.count("reset") == 1
+    assert calls.count("token") == 1
+    recheck = next(
+        step for step in migration.report.steps if step["step"] == "read_only_recheck"
+    )
+    assert recheck["status"] == "ok"
+    assert "target_online=False" in recheck["detail"]
+    assert "retry_safe=True" in recheck["detail"]
+    assert migration._recap == [
+        {
+            "agent": "agent-a",
+            "status": "ok",
+            "detail": "apply retry succeeded after read-only recheck",
+        }
+    ]
+
+
+def test_apply_recheck_is_not_offered_after_destructive_step_started(tmp_path: Path) -> None:
+    calls: list[str] = []
+    prompter = FakePrompter(decision="abort")
+    migration = runner(
+        tmp_path,
+        mode=Mode.APPLY,
+        api=FakeApi(),
+        calls=calls,
+        prompter=prompter,
+    )
+
+    class FailingPostResetSnapshotUi(FakeUi):
+        def snapshot_state(self) -> LocalSnapshot:
+            self.calls.append("snapshot")
+            if self.calls.count("snapshot") == 2:
+                raise UiError("post-reset snapshot failure")
+            return LocalSnapshot(
+                "192.0.2.10",
+                "now",
+                {"browserbot": True, "crash_reports": True},
+            )
+
+    migration.ui_factory = lambda _item: FailingPostResetSnapshotUi(calls)  # type: ignore[assignment]
+
+    with pytest.raises(HumanDecisionRequired, match="Operator aborted"):
+        migration.run([InventoryAgent("agent-a", "192.0.2.10")])
+
+    assert calls.count("reset") == 1
+    assert calls.count("token") == 1
+    assert prompter.failure_recheck_options == [False]
 
 
 def test_existing_target_recovery_deletes_source_without_reset(tmp_path: Path) -> None:

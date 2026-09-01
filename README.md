@@ -17,6 +17,11 @@ there is no SSH, sudo, shell execution, service restart, or OS-level action.
   already running in the active batch are allowed to finish and may have completed changes.
 - Other failures pause for an operator decision. Reachability-related failures offer read-only
   recheck, skip, or abort; deterministic API request errors offer only skip or abort.
+- Before any destructive step starts, a successful UI recheck resumes that agent from the
+  beginning of its workflow. Destination online status is reported for context but is not required
+  because the agent may not have been reset or registered yet.
+- After reset, test mutation, source deletion, or destination name enforcement can begin, the
+  generic recheck option is disabled so the workflow cannot repeat a modifying operation.
 - After the initial visibility window, `recheck` performs one bounded API inventory lookup rather
   than silently starting another 180-second poll.
 - No automatic rollback, source-token re-injection, repeated reset, or modifying-request retry.
