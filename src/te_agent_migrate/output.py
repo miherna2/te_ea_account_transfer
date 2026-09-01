@@ -6,9 +6,10 @@ from datetime import datetime
 
 from rich.console import Console
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
-from te_agent_migrate.models import StepStatus
+from te_agent_migrate.models import AccountGroup, Mode, StepStatus
 
 STATUS_STYLES = {
     StepStatus.OK: "bold green",
@@ -29,6 +30,35 @@ class MigrationConsole:
         self.console.print(
             "[yellow]NOTICE:[/yellow] TLS certificate verification is disabled only for "
             "agent UI connections."
+        )
+
+    def destination_banner(
+        self,
+        source: AccountGroup,
+        target: AccountGroup,
+        mode: Mode,
+        *,
+        destructive: bool = False,
+    ) -> None:
+        """Make the selected registration destination unmistakable to the operator."""
+        title = (
+            "DESTRUCTIVE MIGRATION DESTINATION"
+            if destructive
+            else "MIGRATION DESTINATION"
+        )
+        border_style = "bold red" if destructive else "bold bright_blue"
+        target_style = "bold bright_white on red" if destructive else "bold bright_white on blue"
+        target_label = escape(f"{target.name} [{target.aid}]")
+        source_label = escape(f"{source.name} [{source.aid}]")
+        body = (
+            "[bold]TARGET ACCOUNT GROUP[/bold]\n"
+            f"[{target_style}]  {target_label}  [/{target_style}]\n\n"
+            "[bold]Every selected device will register in this account group.[/bold]\n"
+            f"Source: {source_label}\n"
+            f"Mode: {mode.value.upper()}"
+        )
+        self.console.print(
+            Panel(body, title=f"[bold]{title}[/bold]", border_style=border_style, expand=True)
         )
 
     @staticmethod

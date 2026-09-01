@@ -32,6 +32,9 @@ from te_agent_migrate.workflow import MigrationRunner, recursive_diff
 
 
 class FakeConsole:
+    def destination_banner(self, *_: Any, **__: Any) -> None:
+        pass
+
     def info(self, *_: Any) -> None:
         pass
 

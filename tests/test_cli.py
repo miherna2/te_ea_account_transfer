@@ -1,13 +1,20 @@
 import json
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from rich.console import Console
 
-from te_agent_migrate.cli import _resolve_agent_inputs, _resolve_source_test_policy, main
+from te_agent_migrate.cli import (
+    _resolve_agent_ui_inputs,
+    _resolve_source_test_policy,
+    _resolve_target_account_token,
+    main,
+)
 from te_agent_migrate.errors import ConfigurationError
-from te_agent_migrate.models import StalePolicy
+from te_agent_migrate.models import AccountGroup, Mode, StalePolicy
 from te_agent_migrate.models import TestStrategy as Strategy
 from te_agent_migrate.operator import OperatorPrompter
 from te_agent_migrate.output import MigrationConsole
@@ -40,10 +47,8 @@ def test_agent_inputs_are_loaded_from_environment_without_secret_prompts(
 ) -> None:
     username = "admin"
     password = "environment-password"
-    target_token = "A" * 32
     monkeypatch.setenv("TE_AGENT_UI_USERNAME", username)
     monkeypatch.setenv("TE_AGENT_UI_PASSWORD", password)
-    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN", target_token)
     report = RunReport(tmp_path, "dry-run")
     prompter = OperatorPrompter(report.append_decision)
     monkeypatch.setattr(
@@ -56,14 +61,12 @@ def test_agent_inputs_are_loaded_from_environment_without_secret_prompts(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not prompt")),
     )
 
-    resolved = _resolve_agent_inputs(report, prompter, MigrationConsole())
+    resolved = _resolve_agent_ui_inputs(report, prompter, MigrationConsole())
 
-    assert resolved == (username, password, target_token)
+    assert resolved == (username, password)
     serialized_report = json.dumps(report.to_dict())
     assert password not in serialized_report
-    assert target_token not in serialized_report
     assert "TE_AGENT_UI_PASSWORD" in serialized_report
-    assert "TE_TARGET_ACCOUNT_TOKEN" in serialized_report
 
 
 def test_missing_agent_input_environment_variables_fall_back_to_prompts(
@@ -72,14 +75,13 @@ def test_missing_agent_input_environment_variables_fall_back_to_prompts(
     for name in (
         "TE_AGENT_UI_USERNAME",
         "TE_AGENT_UI_PASSWORD",
-        "TE_TARGET_ACCOUNT_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     report = RunReport(tmp_path, "dry-run")
     prompter = OperatorPrompter(report.append_decision)
     prompt_labels: list[str] = []
     secret_labels: list[str] = []
-    secrets = iter(["prompt-password", "B" * 32])
+    secrets = iter(["prompt-password"])
 
     def prompt(label: str, **_kwargs: Any) -> str:
         prompt_labels.append(label)
@@ -92,29 +94,121 @@ def test_missing_agent_input_environment_variables_fall_back_to_prompts(
     monkeypatch.setattr("te_agent_migrate.cli.click.prompt", prompt)
     monkeypatch.setattr(prompter, "secret", secret)
 
-    resolved = _resolve_agent_inputs(report, prompter, MigrationConsole())
+    resolved = _resolve_agent_ui_inputs(report, prompter, MigrationConsole())
 
-    assert resolved == ("admin", "prompt-password", "B" * 32)
+    assert resolved == ("admin", "prompt-password")
     assert prompt_labels == ["Agent UI username"]
-    assert secret_labels == ["Agent UI password", "Target account-group token"]
+    assert secret_labels == ["Agent UI password"]
 
 
 @pytest.mark.parametrize(
     "empty_variable",
-    ["TE_AGENT_UI_USERNAME", "TE_AGENT_UI_PASSWORD", "TE_TARGET_ACCOUNT_TOKEN"],
+    ["TE_AGENT_UI_USERNAME", "TE_AGENT_UI_PASSWORD"],
 )
 def test_empty_agent_input_environment_variable_is_rejected(
     monkeypatch: Any, tmp_path: Path, empty_variable: str
 ) -> None:
     monkeypatch.setenv("TE_AGENT_UI_USERNAME", "admin")
     monkeypatch.setenv("TE_AGENT_UI_PASSWORD", "password")
-    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN", "A" * 32)
     monkeypatch.setenv(empty_variable, "")
     report = RunReport(tmp_path, "dry-run")
     prompter = OperatorPrompter(report.append_decision)
 
     with pytest.raises(ConfigurationError, match=f"{empty_variable} is set but empty"):
-        _resolve_agent_inputs(report, prompter, MigrationConsole())
+        _resolve_agent_ui_inputs(report, prompter, MigrationConsole())
+
+
+def test_target_token_is_bound_to_selected_target_aid(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    token = "A" * 32
+    target = AccountGroup("144165", "AGENTS_SRC")
+    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN", token)
+    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN_AID", target.aid)
+    report = RunReport(tmp_path, "apply")
+    prompter = OperatorPrompter(report.append_decision)
+    monkeypatch.setattr(
+        prompter,
+        "secret",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not prompt")),
+    )
+
+    resolved = _resolve_target_account_token(target, report, prompter, MigrationConsole())
+
+    assert resolved == token
+    serialized_report = json.dumps(report.to_dict())
+    assert token not in serialized_report
+    assert "TE_TARGET_ACCOUNT_TOKEN_AID" in serialized_report
+    assert target.aid in serialized_report
+
+
+def test_target_token_aid_mismatch_stops_before_agent_reset(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN", "A" * 32)
+    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN_AID", "2136224")
+    target = AccountGroup("144165", "AGENTS_SRC")
+    report = RunReport(tmp_path, "apply")
+    prompter = OperatorPrompter(report.append_decision)
+
+    with pytest.raises(ConfigurationError, match="does not match selected target"):
+        _resolve_target_account_token(target, report, prompter, MigrationConsole())
+
+
+def test_environment_target_token_requires_aid_binding(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("TE_TARGET_ACCOUNT_TOKEN", "A" * 32)
+    monkeypatch.delenv("TE_TARGET_ACCOUNT_TOKEN_AID", raising=False)
+    target = AccountGroup("144165", "AGENTS_SRC")
+    report = RunReport(tmp_path, "apply")
+    prompter = OperatorPrompter(report.append_decision)
+
+    with pytest.raises(ConfigurationError, match="TE_TARGET_ACCOUNT_TOKEN_AID must also be set"):
+        _resolve_target_account_token(target, report, prompter, MigrationConsole())
+
+
+def test_prompted_target_token_names_selected_destination(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    token = "B" * 32
+    target = AccountGroup("144165", "AGENTS_SRC")
+    monkeypatch.delenv("TE_TARGET_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("TE_TARGET_ACCOUNT_TOKEN_AID", raising=False)
+    report = RunReport(tmp_path, "apply")
+    prompter = OperatorPrompter(report.append_decision)
+    labels: list[str] = []
+
+    def secret(label: str) -> str:
+        labels.append(label)
+        return token
+
+    monkeypatch.setattr(prompter, "secret", secret)
+
+    resolved = _resolve_target_account_token(target, report, prompter, MigrationConsole())
+
+    assert resolved == token
+    assert labels == ["Target account-group token for AGENTS_SRC [144165]"]
+
+
+def test_destination_banner_emphasizes_exact_target_account_group() -> None:
+    output = StringIO()
+    console = MigrationConsole(
+        Console(file=output, force_terminal=False, color_system=None, width=100)
+    )
+
+    console.destination_banner(
+        AccountGroup("2136224", "AGENTS_DST"),
+        AccountGroup("144165", "AGENTS_SRC"),
+        Mode.APPLY,
+        destructive=True,
+    )
+
+    rendered = output.getvalue()
+    assert "DESTRUCTIVE MIGRATION DESTINATION" in rendered
+    assert "AGENTS_SRC [144165]" in rendered
+    assert "Source: AGENTS_DST [2136224]" in rendered
+    assert "Every selected device will register in this account group" in rendered
 
 
 def test_stale_policy_is_not_prompted_and_is_ignored_for_strategy_a(

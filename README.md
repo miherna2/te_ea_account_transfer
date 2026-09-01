@@ -75,6 +75,7 @@ macOS Terminal (`zsh`/`bash`):
 export TE_AGENT_UI_USERNAME='admin'
 export TE_AGENT_UI_PASSWORD='<agent-ui-password>'
 export TE_TARGET_ACCOUNT_TOKEN='<32-character-target-token>'
+export TE_TARGET_ACCOUNT_TOKEN_AID='<target-account-group-aid>'
 ```
 
 Windows PowerShell:
@@ -83,6 +84,7 @@ Windows PowerShell:
 $env:TE_AGENT_UI_USERNAME = 'admin'
 $env:TE_AGENT_UI_PASSWORD = '<agent-ui-password>'
 $env:TE_TARGET_ACCOUNT_TOKEN = '<32-character-target-token>'
+$env:TE_TARGET_ACCOUNT_TOKEN_AID = '<target-account-group-aid>'
 ```
 
 Windows Command Prompt (`cmd.exe`):
@@ -91,14 +93,19 @@ Windows Command Prompt (`cmd.exe`):
 set "TE_AGENT_UI_USERNAME=admin"
 set "TE_AGENT_UI_PASSWORD=YOUR_AGENT_UI_PASSWORD"
 set "TE_TARGET_ACCOUNT_TOKEN=YOUR_32_CHARACTER_TARGET_TOKEN"
+set "TE_TARGET_ACCOUNT_TOKEN_AID=TARGET_ACCOUNT_GROUP_AID"
 ```
 
-Any missing value is requested interactively; passwords and tokens use hidden prompts. Variables
-that are set but empty are rejected. Password and token values are never written to console logs or
-audit artifacts. To remove them from the current terminal session after the run:
+Any missing value is requested interactively; passwords and tokens use hidden prompts. The target
+account group is selected before the registration token is resolved, so an interactive token prompt
+always names the exact destination account group and AID. When `TE_TARGET_ACCOUNT_TOKEN` is loaded
+from the environment, `TE_TARGET_ACCOUNT_TOKEN_AID` is required and must match the selected target.
+A mismatch stops before any agent reset. Variables that are set but empty are rejected. Password and
+token values are never written to console logs or audit artifacts. To remove them from the current
+terminal session after the run:
 
 ```bash
-unset TE_AGENT_UI_USERNAME TE_AGENT_UI_PASSWORD TE_TARGET_ACCOUNT_TOKEN
+unset TE_AGENT_UI_USERNAME TE_AGENT_UI_PASSWORD TE_TARGET_ACCOUNT_TOKEN TE_TARGET_ACCOUNT_TOKEN_AID
 ```
 
 PowerShell equivalent:
@@ -107,6 +114,7 @@ PowerShell equivalent:
 Remove-Item Env:TE_AGENT_UI_USERNAME
 Remove-Item Env:TE_AGENT_UI_PASSWORD
 Remove-Item Env:TE_TARGET_ACCOUNT_TOKEN
+Remove-Item Env:TE_TARGET_ACCOUNT_TOKEN_AID
 ```
 
 Command Prompt equivalent:
@@ -115,6 +123,7 @@ Command Prompt equivalent:
 set "TE_AGENT_UI_USERNAME="
 set "TE_AGENT_UI_PASSWORD="
 set "TE_TARGET_ACCOUNT_TOKEN="
+set "TE_TARGET_ACCOUNT_TOKEN_AID="
 ```
 
 The API bearer token is resolved in this order:

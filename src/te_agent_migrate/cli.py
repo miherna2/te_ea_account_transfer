@@ -29,6 +29,7 @@ TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9]{32}$")
 UI_USERNAME_ENV = "TE_AGENT_UI_USERNAME"
 UI_PASSWORD_ENV = "TE_AGENT_UI_PASSWORD"
 TARGET_ACCOUNT_TOKEN_ENV = "TE_TARGET_ACCOUNT_TOKEN"
+TARGET_ACCOUNT_TOKEN_AID_ENV = "TE_TARGET_ACCOUNT_TOKEN_AID"
 
 
 def _environment_value(name: str) -> str | None:
@@ -40,11 +41,11 @@ def _environment_value(name: str) -> str | None:
     return value
 
 
-def _resolve_agent_inputs(
+def _resolve_agent_ui_inputs(
     report: RunReport,
     prompter: OperatorPrompter,
     console: MigrationConsole,
-) -> tuple[str, str, str]:
+) -> tuple[str, str]:
     ui_username = _environment_value(UI_USERNAME_ENV)
     if ui_username is None:
         ui_username = click.prompt("Agent UI username")
@@ -60,19 +61,59 @@ def _resolve_agent_inputs(
         report.record_decision("Agent UI password", f"<environment:{UI_PASSWORD_ENV}>")
         console.info("input", f"Agent UI password loaded from {UI_PASSWORD_ENV}")
 
+    return ui_username, ui_password
+
+
+def _resolve_target_account_token(
+    target: AccountGroup,
+    report: RunReport,
+    prompter: OperatorPrompter,
+    console: MigrationConsole,
+) -> str:
+    """Resolve a registration token only after the exact target AID is known."""
     target_token = _environment_value(TARGET_ACCOUNT_TOKEN_ENV)
     if target_token is None:
-        target_token = prompter.secret("Target account-group token")
+        target_token = prompter.secret(
+            f"Target account-group token for {target.name} [{target.aid}]"
+        )
+        report.record_decision(
+            "Target account-group token binding",
+            f"hidden prompt bound to {target.name} [{target.aid}]",
+        )
+        console.info(
+            "input",
+            f"Target account-group token received for {target.name} [{target.aid}]",
+        )
     else:
+        token_aid = _environment_value(TARGET_ACCOUNT_TOKEN_AID_ENV)
+        if token_aid is None:
+            raise ConfigurationError(
+                f"{TARGET_ACCOUNT_TOKEN_AID_ENV} must also be set when "
+                f"{TARGET_ACCOUNT_TOKEN_ENV} is loaded from the environment; expected "
+                f"{target.aid} for {target.name}. No agents were reset."
+            )
+        if token_aid != target.aid:
+            raise ConfigurationError(
+                f"{TARGET_ACCOUNT_TOKEN_AID_ENV}={token_aid} does not match selected target "
+                f"{target.name} [{target.aid}]. No agents were reset."
+            )
         report.record_decision(
             "Target account-group token", f"<environment:{TARGET_ACCOUNT_TOKEN_ENV}>"
         )
-        console.info("input", f"Target account-group token loaded from {TARGET_ACCOUNT_TOKEN_ENV}")
+        report.record_decision(
+            "Target account-group token binding",
+            f"{target.name} [{target.aid}] via {TARGET_ACCOUNT_TOKEN_AID_ENV}",
+        )
+        console.info(
+            "input",
+            f"Target account-group token loaded from {TARGET_ACCOUNT_TOKEN_ENV} and bound "
+            f"to {target.name} [{target.aid}] via {TARGET_ACCOUNT_TOKEN_AID_ENV}",
+        )
     if not TOKEN_PATTERN.fullmatch(target_token):
         raise ConfigurationError(
             "Target account-group token must be exactly 32 alphanumeric characters"
         )
-    return ui_username, ui_password, target_token
+    return target_token
 
 
 def _resolve_source_test_policy(
@@ -244,9 +285,9 @@ def main(
         )
         console.info(
             "input",
-            "resolving UI credentials and tokens; secret values are hidden and never logged",
+            "resolving UI credentials; secret values are hidden and never logged",
         )
-        ui_username, ui_password, target_token = _resolve_agent_inputs(report, prompter, console)
+        ui_username, ui_password = _resolve_agent_ui_inputs(report, prompter, console)
         api_token = os.getenv("TE_OAUTH_TOKEN") or os.getenv("THOUSANDEYES_OAUTH_TOKEN")
         if api_token:
             report.record_decision("API v7 OAuth bearer token", "<environment>")
@@ -285,6 +326,8 @@ def main(
                 "configuration",
                 f"source={source.name} [{source.aid}]; target={target.name} [{target.aid}]",
             )
+            console.destination_banner(source, target, selected_mode)
+            target_token = _resolve_target_account_token(target, report, prompter, console)
             runner = MigrationRunner(
                 api=api,
                 ui_factory=lambda item: TevaUiClient(item.ip_address, ui_username, ui_password),

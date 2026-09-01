@@ -1631,6 +1631,12 @@ class MigrationRunner:
             if self._destructive_confirmed:
                 return
             with self._prompt_lock:
+                self.console.destination_banner(
+                    self.source_group,
+                    self.target_group,
+                    self.options.mode,
+                    destructive=True,
+                )
                 if not self.prompter.confirm_destructive():
                     raise HumanDecisionRequired("Operator declined the destructive action gate")
             self._destructive_confirmed = True
