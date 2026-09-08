@@ -31,11 +31,22 @@ class OperatorPrompter:
         self._audit(prompt, response, agent=agent)
 
     def secret(self, prompt: str) -> str:
-        value = getpass.getpass(f"{prompt}: ")
-        self._audit(prompt, "<redacted>")
-        if not value:
-            raise ConfigurationError(f"{prompt} cannot be empty")
-        return value
+        while True:
+            value = getpass.getpass(f"{prompt}: ")
+            if value:
+                self._audit(prompt, "<redacted>")
+                return value
+            click.echo(f"Error: {prompt} cannot be empty; type a value.", err=True)
+
+    @staticmethod
+    def _required_choice(prompt: str, choices: list[str]) -> str:
+        return str(
+            click.prompt(
+                prompt,
+                type=click.Choice(choices, case_sensitive=False),
+                show_choices=True,
+            )
+        ).lower()
 
     def choose_account_group(self, prompt: str, groups: list[AccountGroup]) -> AccountGroup:
         if not groups:
@@ -51,14 +62,14 @@ class OperatorPrompter:
 
     def confirm_destructive(self) -> bool:
         prompt = "Begin destructive migration actions"
-        answer = click.confirm(f"{prompt}?", default=False)
+        answer = self._required_choice(f"{prompt}?", ["y", "n"]) == "y"
         self._audit(prompt, "yes" if answer else "no")
         return answer
 
     def continue_after_batch(self, batch_number: int, agents: list[str]) -> bool:
         agent_summary = ", ".join(agents)
         prompt = f"Continue after batch {batch_number} ({agent_summary})"
-        answer = click.confirm(f"{prompt}?", default=False)
+        answer = self._required_choice(f"{prompt}?", ["y", "n"]) == "y"
         self._audit(prompt, "yes" if answer else "no")
         return answer
 
@@ -66,13 +77,6 @@ class OperatorPrompter:
         choices = ["recheck", "skip", "abort"] if allow_recheck else ["skip", "abort"]
         action_text = "read-only recheck, skip, or abort" if allow_recheck else "skip or abort"
         prompt = f"Failure on {agent}: {detail}. Choose {action_text}"
-        answer = str(
-            click.prompt(
-                prompt,
-                type=click.Choice(choices, case_sensitive=False),
-                default="abort",
-                show_choices=True,
-            )
-        ).lower()
+        answer = self._required_choice(prompt, choices)
         self._audit(prompt, answer, agent=agent)
         return answer

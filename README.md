@@ -17,6 +17,9 @@ there is no SSH, sudo, shell execution, service restart, or OS-level action.
   already running in the active batch are allowed to finish and may have completed changes.
 - Other failures pause for an operator decision. Reachability-related failures offer read-only
   recheck, skip, or abort; deterministic API request errors offer only skip or abort.
+- Interactive prompts never assign an action to an empty Enter response. Operators must type an
+  explicit displayed choice, including `y` or `n` confirmations and `recheck`, `skip`, or `abort`
+  failure decisions; blank responses are rejected and prompt again.
 - Before any destructive step starts, a successful UI recheck resumes that agent from the
   beginning of its workflow. Destination online status is reported for context but is not required
   because the agent may not have been reset or registered yet.
