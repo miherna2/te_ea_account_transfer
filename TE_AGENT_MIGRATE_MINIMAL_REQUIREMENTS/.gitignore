@@ -1,0 +1,6 @@
+.env
+.venv*/
+inventory.csv
+reports/
+__pycache__/
+*.py[cod]
