@@ -85,6 +85,7 @@ class MigrationRunner:
         self._source_test_cleanup_candidates = {}
         self._source_test_known_agent_ids = {}
         self._source_test_preserved_agent_ids = {}
+        self._selected_source_agent_ids = set()
         self._completed_source_agent_ids = set()
         self._strategy_c_source_tests = {}
         self._strategy_c_unassigned_tests = []
@@ -392,43 +393,38 @@ class MigrationRunner:
         if self.options.strategy.value != 'C':
             return
         correlation_id = str(uuid.uuid4())
-        with self.step(correlation_id, None, 'strategy_c_source_test_inventory', start_detail='capturing all source tests and agent associations before migration'):
+        with self.step(correlation_id, None, 'strategy_c_source_test_inventory', start_detail='capturing source tests and selected-agent associations before migration'):
             source_agents = self.api.list_agents(self.source_group.aid, agent_types='CLOUD,ENTERPRISE')
-            target_agents = self.api.list_agents(self.target_group.aid, agent_types='CLOUD,ENTERPRISE')
             source_enterprise_agents = [agent for agent in source_agents if agent.agent_type in {None, 'enterprise'}]
             source_identity_groups = [self._matching_source_identities(source_enterprise_agents, item) for item in inventory]
             selected_source_agents = [agent for source_identities in source_identity_groups for agent in source_identities]
             summaries = self.api.list_tests(self.source_group.aid)
-            details = [self.api.get_test(self.source_group.aid, test.test_type, test.test_id) for test in summaries]
         selected_source_agent_ids = {agent.agent_id for agent in selected_source_agents}
-        source_agents_by_id = {agent.agent_id: agent for agent in source_agents}
-        target_agents_by_id = {agent.agent_id: agent for agent in target_agents}
+        self._selected_source_agent_ids = set(selected_source_agent_ids)
+        selected_test_ids = {
+            str(test_id)
+            for agent in selected_source_agents
+            for test_id in agent.test_ids
+        }
+        scoped_summaries = [test for test in summaries if test.test_id in selected_test_ids]
+        scope_name = 'selected-inventory-agents'
+        details = [
+            self.api.get_test(self.source_group.aid, test.test_type, test.test_id)
+            for test in scoped_summaries
+        ]
         outside_inventory = {}
         for test in details:
             source_agent_ids = test_agent_ids(test)
             portable_agent_ids = set()
-            for agent_id in source_agent_ids - selected_source_agent_ids:
-                source_agent = source_agents_by_id.get(agent_id)
-                target_agent = target_agents_by_id.get(agent_id)
-                if (
-                    source_agent is not None
-                    and source_agent.agent_type == 'cloud'
-                    and target_agent is not None
-                    and target_agent.agent_type == 'cloud'
-                ):
-                    portable_agent_ids.add(agent_id)
-            unknown_agent_ids = sorted(source_agent_ids - selected_source_agent_ids - portable_agent_ids)
+            unknown_agent_ids = sorted(source_agent_ids - selected_source_agent_ids)
             if unknown_agent_ids:
                 outside_inventory[test.test_id] = unknown_agent_ids
             key = (test.test_type, test.test_id)
             self._source_test_known_agent_ids[key] = set(source_agent_ids)
             self._source_test_preserved_agent_ids[key] = portable_agent_ids
-        if outside_inventory:
-            summary = '; '.join((f"test {test_id}: {','.join(agent_ids)}" for test_id, agent_ids in sorted(outside_inventory.items())))
-            raise HardStop(f'Strategy C cannot migrate every source test because some tests are associated with source agents outside the selected inventory ({summary})')
         self._strategy_c_source_tests = {test.test_id: test for test in details}
-        self._strategy_c_monitor_tests = [test for test in details if test.test_type in MONITOR_BASED_TEST_TYPES]
-        self._strategy_c_unassigned_tests = [test for test in details if test.test_type not in MONITOR_BASED_TEST_TYPES and (not test_agent_ids(test))]
+        self._strategy_c_monitor_tests = []
+        self._strategy_c_unassigned_tests = []
         if self._strategy_c_monitor_tests:
             target_monitor_ids = monitor_catalog_ids(self.api.list_monitors(self.target_group.aid))
             missing_monitors = {test.test_id: sorted(test_monitor_ids(test) - target_monitor_ids) for test in self._strategy_c_monitor_tests if test_monitor_ids(test) - target_monitor_ids}
@@ -443,9 +439,12 @@ class MigrationRunner:
             self._ensure_destructive_confirmation()
         with self.step(correlation_id, None, 'strategy_c_resource_reconciliation', start_detail='reconciling requested tags and alert rules before any agent move' if self.options.create_missing_tags or self.options.create_missing_alerts else 'tag and alert-rule creation disabled; tests will omit both'):
             resource_summary = self.strategy.prepare_recreate_resources(source_tests=recreatable_tests, source_aid=self.source_group.aid, target_aid=self.target_group.aid, create_missing_tags=self.options.create_missing_tags, create_missing_alerts=self.options.create_missing_alerts, dry_run=self.options.mode is Mode.DRY_RUN)
-        self.report.metadata.update({'strategy_c_source_test_count': len(details), 'strategy_c_unassigned_source_test_count': len(self._strategy_c_unassigned_tests), 'strategy_c_unassigned_test_policy': 'assign-all-migrated-agents', 'strategy_c_monitor_based_source_test_count': len(self._strategy_c_monitor_tests), 'strategy_c_monitor_based_test_policy': 'recreate-once-preserve-monitors-no-agent-assignment', 'strategy_c_test_name_policy': 'preserve-exact', 'strategy_c_preserved_cloud_agent_association_count': sum((len(agent_ids) for agent_ids in self._source_test_preserved_agent_ids.values())), 'strategy_c_tags_created': resource_summary.tags_created, 'strategy_c_tags_reused': resource_summary.tags_reused, 'strategy_c_tags_projected': resource_summary.tags_projected, 'strategy_c_alert_rules_created': resource_summary.alert_rules_created, 'strategy_c_alert_rules_reused': resource_summary.alert_rules_reused, 'strategy_c_alert_rules_projected': resource_summary.alert_rules_projected})
+        self.report.metadata.update({'strategy_c_scope': scope_name, 'strategy_c_total_source_test_count': len(summaries), 'strategy_c_source_test_count': len(details), 'strategy_c_skipped_out_of_scope_test_count': len(summaries) - len(details), 'strategy_c_tests_with_non_migrated_associations': len(outside_inventory), 'strategy_c_unassigned_source_test_count': 0, 'strategy_c_unassigned_test_policy': 'out-of-scope-not-associated-with-inventory', 'strategy_c_monitor_based_source_test_count': 0, 'strategy_c_monitor_based_test_policy': 'out-of-scope-not-associated-with-inventory', 'strategy_c_test_name_policy': 'preserve-exact', 'strategy_c_preserved_cloud_agent_association_count': 0, 'strategy_c_tags_created': resource_summary.tags_created, 'strategy_c_tags_reused': resource_summary.tags_reused, 'strategy_c_tags_projected': resource_summary.tags_projected, 'strategy_c_alert_rules_created': resource_summary.alert_rules_created, 'strategy_c_alert_rules_reused': resource_summary.alert_rules_reused, 'strategy_c_alert_rules_projected': resource_summary.alert_rules_projected})
         self.console.info('strategy_c_resource_reconciliation', f'tags created={resource_summary.tags_created}, reused={resource_summary.tags_reused}, projected={resource_summary.tags_projected}; alert rules created={resource_summary.alert_rules_created}, reused={resource_summary.alert_rules_reused}, projected={resource_summary.alert_rules_projected}')
-        self._event(correlation_id, None, 'strategy_c_source_test_inventory', StepStatus.OK, f'captured {len(details)} source test(s); {len(self._strategy_c_unassigned_tests)} unassigned test(s) will be assigned to every migrated inventory agent; {len(self._strategy_c_monitor_tests)} monitor-based test(s) will be recreated once without agent associations')
+        association_note = ''
+        if outside_inventory:
+            association_note = f'; {len(outside_inventory)} selected test(s) also reference non-migrated agents and will remain in source when removal would be unsafe'
+        self._event(correlation_id, None, 'strategy_c_source_test_inventory', StepStatus.OK, f'scope={scope_name}; selected {len(details)} of {len(summaries)} source test(s); {len(self._strategy_c_unassigned_tests)} unassigned test(s); {len(self._strategy_c_monitor_tests)} monitor-based test(s){association_note}')
 
     def _handle_strategy_c_unassigned_tests(self, inventory):
         if self.options.strategy.value != 'C' or not self._strategy_c_unassigned_tests:
@@ -551,15 +550,30 @@ class MigrationRunner:
             self._source_test_known_agent_ids.setdefault(key, set()).add(source_agent_id)
         if successfully_recreated and (not dry_run) and (self.options.stale_policy.value == 'remove'):
             self._source_test_cleanup_candidates[key] = test
+        policy_detail = {}
         if action_status == 'unsupported':
             action = 'kept-unsupported'
+        elif dry_run and self.options.stale_policy.value == 'remove':
+            known_agent_ids = self._source_test_known_agent_ids.get(key, set())
+            preserved_agent_ids = self._source_test_preserved_agent_ids.get(key, set())
+            expected_source_agent_ids = (test_agent_ids(test) | known_agent_ids) - preserved_agent_ids
+            non_migrated_agent_ids = sorted(
+                expected_source_agent_ids - self._selected_source_agent_ids
+            )
+            if non_migrated_agent_ids:
+                action = 'projected-keep-incomplete-associations'
+                policy_detail['missing_source_agent_ids'] = non_migrated_agent_ids
+            else:
+                action = 'projected-remove'
         elif dry_run:
             action = f'projected-{self.options.stale_policy.value}'
         elif self.options.stale_policy.value == 'remove':
             action = 'deferred-remove'
         else:
             action = 'kept'
-        self.report.add_stale_entry({'entry_type': 'source-test', 'agent': agent_label or inventory_agent.hostname, 'source_test_id': test.test_id, 'source_test_name': test.name, 'test_type': test.test_type, 'source_aid': self.source_group.aid, 'policy': self.options.stale_policy.value, 'recreated_in_target': successfully_recreated, 'action': action})
+        row = {'entry_type': 'source-test', 'agent': agent_label or inventory_agent.hostname, 'source_test_id': test.test_id, 'source_test_name': test.name, 'test_type': test.test_type, 'source_aid': self.source_group.aid, 'policy': self.options.stale_policy.value, 'recreated_in_target': successfully_recreated, 'action': action}
+        row.update(policy_detail)
+        self.report.add_stale_entry(row)
 
     def _cleanup_source_tests(self):
         correlation_id = str(uuid.uuid4())

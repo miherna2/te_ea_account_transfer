@@ -23,7 +23,11 @@ The tool migrates ThousandEyes Enterprise Agents between account groups using AP
 - **Strategy A:** migrate agents only.
 - **Strategy B:** migrate agents, share their tests with the target account group, and assign the migrated agents.
 - **Strategy C:** migrate agents and recreate supported tests in the target account group with their exact names, enabled state, and agent associations.
+- `inventory.csv` is the strict migration boundary. Strategy C recreates only tests assigned to the selected Enterprise Agents, even when the inventory happens to contain every Enterprise Agent in the source account group.
+- Unrelated tests, unassigned tests, monitor-only tests, and agents absent from `inventory.csv` remain untouched.
+- Tags and alert rules are considered only when referenced by an in-scope test and only when their corresponding opt-in creation flags are enabled.
 - `--stale keep|remove` applies only to Strategy C source tests.
+- With `--stale remove`, a recreated source test is retained when it still has associations to Enterprise Agents outside the inventory or to agents that did not complete. This prevents disruption to non-migrated agents.
 - Source agent identities are deleted in every apply strategy after the destination identity is online and validated.
 - `--create-missing-tags` and `--create-missing-alerts` opt in to Strategy C reconciliation of missing test tags and alert rules.
 - `--parallel 1..5` controls the maximum number of agent UI connections in each batch.
