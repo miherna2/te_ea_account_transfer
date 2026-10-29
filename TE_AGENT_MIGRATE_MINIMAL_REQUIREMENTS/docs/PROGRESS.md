@@ -80,6 +80,10 @@ Related documents: [Plan](MIGRATION_PLAN.md), [Lab](LAB.md).
   API calls are not proven. Lab cases L16 to L20 decide.
 - 28 Oct: lab seed is plan-driven. Plan from the Excel file, 12 devices for 12 VMs, 6 waves.
   Dashboards are not seeded (manual list). Suite: 832 tests pass (5 skipped).
+- 29 Oct: DECISION (user): production runs on Python 3.9 or newer, not 3.6. The code stays 3.6
+  compatible, but a Python 3.6 test run is no longer a gate.
+- 29 Oct: local git repo repaired (the OneDrive `.git` was broken). Old `.git` kept as `.git.broken-*`.
+- 29 Oct: the owner of the 5 already-migrated devices is not known. Added to the customer questions.
 
 ## Next steps
 
@@ -92,6 +96,17 @@ Related documents: [Plan](MIGRATION_PLAN.md), [Lab](LAB.md).
 5. Run the owner probe. Record the result in the plan.
 6. Write the resume procedure for each state ([Plan](MIGRATION_PLAN.md#11-rollback-and-recovery)).
 7. Name the owner of each manual step. Set the wave list and dates.
-8. Run the unit tests on Python 3.6.
+8. (Dropped) Python 3.6 run. Production uses Python 3.9 or newer.
 9. Run the pilot (2-3 devices). Review. Then start the waves.
 10. Update the code comments that point to old plan sections.
+
+## Pending for 29 Oct (the user runs the lab)
+
+1. Build the full sandbox: 21 groups `SBX-G01` to `SBX-G21`, 12 TEVA VMs, a sandbox token.
+   The assistant helps with the steps. See [Lab](LAB.md#7-lab-from-the-excel-scope).
+2. Run lab cases L1 to L11, then L16 to L20.
+   **REMINDER: if L18, L19 or L20 fails, show the evidence and ask the user how to proceed.**
+3. Collect one registration token for each target account group. The user does not have them yet.
+   TODO: Find out where the token is shown for each group and write the steps in the runbook.
+4. Send the customer questions ([Plan](MIGRATION_PLAN.md#16-questions-for-the-customer)).
+5. Then run the production dry run with `--owner-is-source`. It is read only.

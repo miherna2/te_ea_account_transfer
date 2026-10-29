@@ -356,5 +356,6 @@ Send these questions before the first wave.
    target of these tests to the new agent ID? Who owns these tests?
 5. **Devices already migrated.** Five devices of one division have new agent IDs and
    are online in the target group. Was this done on purpose? Do they need other checks?
+   Status: open. Nobody on our side knows who moved them.
 6. **Change window and wave dates.** When may the tool reset agents?
 7. **Manual steps.** Who restores the agent notification rules after each wave?
