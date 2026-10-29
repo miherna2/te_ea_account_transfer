@@ -234,8 +234,9 @@ class MatchingTests(PreflightBase):
         self.assertIn('neither', item.reasons[0])
 
     def test_agent_id_not_found_is_blocked(self):
+        # no live agent has this id, and none has this name and IP: nothing to fall back to
         api = FakeApi(agents={SRC: [row(1, 'A', '10.0.0.1')]})
-        item = self.run_one(api, inv('A', '10.0.0.1', agent_id='77'))
+        item = self.run_one(api, inv('B', '10.0.0.9', agent_id='77'))
         self.assertEqual(item.status, 'blocked')
         self.assertIn('77', item.reasons[0])
 

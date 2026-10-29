@@ -1,0 +1,4 @@
+type,name,ip_address,agent_id,target_aid,share_aids
+agent,AAAA - HOST01,192.0.2.11,5001,100,100;900;400
+agent,AAAA - HOST02,192.0.2.12,5002,100,100;900;300
+agent,BBBB - HOST03,192.0.2.13,,200,200;900

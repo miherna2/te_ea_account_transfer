@@ -2,7 +2,7 @@
 # Discovery: read-only GET requests to ThousandEyes API v7.
 # Reads every account group that the token can see. Follows pagination.
 #
-# Usage: ./te_discovery.sh [output_dir]        (default: ./discovery_output)
+# Usage: ./te_discovery.sh [output_dir]        (default: ./work/discovery)
 #
 # Optional environment variables:
 #   TE_TOKEN        API token. If not set, the script asks for it (hidden).
@@ -17,7 +17,7 @@
 # downloads what is missing. The token is never saved.
 set -u
 
-OUT_DIR="${1:-discovery_output}"
+OUT_DIR="${1:-work/discovery}"
 B="https://api.thousandeyes.com/v7"
 INVENTORY_CSV="${INVENTORY_CSV:-}"
 DASHBOARD_AIDS="${DASHBOARD_AIDS:-}"

@@ -1,13 +1,8 @@
 .env
 .venv*/
-inventory.csv
-reports/
-discovery_output/
-report_out/
 __pycache__/
 *.py[cod]
-sandbox_output/
-sandbox_map.json
 
-*.xlsx
+# Everything the tool reads or writes at run time (customer data, reports, snapshots).
 work/
+*.xlsx

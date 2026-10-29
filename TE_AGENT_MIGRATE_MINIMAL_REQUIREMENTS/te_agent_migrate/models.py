@@ -75,15 +75,21 @@ class InventoryAgent(_Record):
 
     For clusters ``hostname`` holds the cluster display name and
     ``ip_address`` may be an empty string.
+
+    Inventory v3 adds two optional values. ``target_aid`` is the target group of
+    this row (None = use the target of the run). ``share_aids`` is the list of
+    groups that must see the agent after the move (the target is part of it).
     """
 
-    _field_names = ("hostname", "ip_address", "kind", "agent_id")
+    _field_names = ("hostname", "ip_address", "kind", "agent_id", "target_aid", "share_aids")
 
-    def __init__(self, hostname, ip_address, kind="agent", agent_id=None):
+    def __init__(self, hostname, ip_address, kind="agent", agent_id=None, target_aid=None, share_aids=None):
         self.hostname = hostname
         self.ip_address = ip_address
         self.kind = kind
         self.agent_id = agent_id
+        self.target_aid = str(target_aid) if target_aid else None
+        self.share_aids = [str(aid) for aid in (share_aids or [])]
 
     @property
     def is_cluster(self):

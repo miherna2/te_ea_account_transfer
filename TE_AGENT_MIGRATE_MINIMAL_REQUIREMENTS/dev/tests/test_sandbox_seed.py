@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from sandbox import seed_sandbox as seed
+from dev.sandbox import seed_sandbox as seed
 from te_agent_migrate.errors import ApiError
 from te_agent_migrate.models import AccountGroup, AgentRecord, TestRecord
 
@@ -197,7 +197,7 @@ class SeedTestCase(unittest.TestCase):
             json.dump(data, handle)
 
     def run_cli(self, api, *extra, **kwargs):
-        argv = ["--map", self.map_path, "--output", self.out_dir]
+        argv = ["--layout", "generic", "--map", self.map_path, "--output", self.out_dir]
         if kwargs.get("ack", True):
             argv.append("--i-know-this-is-sandbox")
         argv.extend(extra)

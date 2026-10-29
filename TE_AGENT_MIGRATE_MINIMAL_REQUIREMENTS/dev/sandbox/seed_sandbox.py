@@ -1,10 +1,15 @@
 """Seed an EMPTY ThousandEyes SANDBOX so that the Strategy D tool can be tested (MIGRATION_PLAN.md, section 20).
 
-Run from the project root:
+Run from the project root. The default layout is PLAN-DRIVEN (see lab_plan.py and lab_seed.py): the lab copies
+the shape of the real scope workbook with anonymous names (SBX-G01.., SBX-D001..).
 
-    python -m sandbox.seed_sandbox --map sandbox_map.json --i-know-this-is-sandbox            (dry run)
-    python -m sandbox.seed_sandbox --map sandbox_map.json --i-know-this-is-sandbox --apply
-    python -m sandbox.seed_sandbox --map sandbox_map.json --i-know-this-is-sandbox --cleanup --apply
+    python -m dev.sandbox.seed_sandbox --xlsx FILE.xlsx --plan-only --write-plan work/sandbox/lab_plan.json
+    python -m dev.sandbox.seed_sandbox --map work/input/sandbox_map.json --i-know-this-is-sandbox            (dry run)
+    python -m dev.sandbox.seed_sandbox --map work/input/sandbox_map.json --i-know-this-is-sandbox --apply
+    python -m dev.sandbox.seed_sandbox --map work/input/sandbox_map.json --i-know-this-is-sandbox --verify
+    python -m dev.sandbox.seed_sandbox --map work/input/sandbox_map.json --i-know-this-is-sandbox --cleanup --apply
+
+The old generic layout (S1..S6, clusters C1/C2, X1) stays available with ``--layout generic``.
 
 Safety rules (all enforced in code):
 - The map file must contain ``"sandbox": true`` AND the flag ``--i-know-this-is-sandbox`` must be given.
@@ -43,7 +48,7 @@ WRITE_PAUSE_SECONDS = 0.2
 ASSIGN_CHUNK = 100
 RESULT_FILE = "sandbox_seed_result.json"
 MANUAL_TASKS_FILE = "sandbox_manual_tasks.md"
-DEFAULT_OUTPUT_DIR = "sandbox_output"
+DEFAULT_OUTPUT_DIR = "work/sandbox"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -495,6 +500,10 @@ class Seeder(object):
         self._plan = None
         self._tests = {}
         self._label_of_aid = dict((aid, label) for label, aid in cfg.groups.items())
+        # Hooks for the plan layout (dev/sandbox/lab_seed.py). The generic layout keeps these values.
+        self.source_label = "SOURCE"
+        self.tag_defs = TAG_DEFS
+        self.tag_pairs = TAG_PAIRS
         self.bucket = "created" if self.apply else "planned"
         self.result = {
             "schema": 1,
@@ -538,6 +547,14 @@ class Seeder(object):
             self.console.status(StepStatus.FAILED, host, None, text)
             raise SeedError("%s: %s" % (host, text))
 
+    def group_labels(self):
+        """Labels of the groups of the map that this layout uses (generic: the fixed labels)."""
+        return [label for label in GROUP_LABELS if label in self.cfg.groups]
+
+    def test_groups(self):
+        """Labels of the groups that get tests, in order."""
+        return list(TEST_GROUP_ORDER)
+
     def _verb(self, past, future):
         return past if self.apply else "would " + future
 
@@ -577,7 +594,8 @@ class Seeder(object):
         if label in self.cluster_ids:
             return self.cluster_ids[label]
         members = self.cfg.clusters[label]
-        agents = self._call(label, "list agents", self.api.list_agents_with_clusters, self.cfg.groups["SOURCE"])
+        agents = self._call(label, "list agents", self.api.list_agents_with_clusters,
+                            self.cfg.groups[self.source_label])
         found = self._find_cluster(agents, members)
         self.cluster_ids[label] = found.agent_id if found is not None else members[0]
         return self.cluster_ids[label]
@@ -587,7 +605,7 @@ class Seeder(object):
         self.console.scope = "preflight"
         groups = self._call("global", "list account groups", self.api.list_account_groups)
         names = dict((str(g.aid), g.name) for g in groups)
-        for label in GROUP_LABELS:
+        for label in self.group_labels():
             aid = self.cfg.groups.get(label)
             if aid is None:
                 continue
@@ -603,7 +621,7 @@ class Seeder(object):
     def step_clusters(self):
         self.console.scope = "clusters"
         task = "clusters"
-        source = self.cfg.groups["SOURCE"]
+        source = self.cfg.groups[self.source_label]
         agents = self._call("global", "list agents", self.api.list_agents_with_clusters, source)
         known = set(a.agent_id for a in agents)
         for label in sorted(self.cfg.clusters):
@@ -681,7 +699,7 @@ class Seeder(object):
 
     # ------------------------------------------------------------------ step: tests
     def step_tests(self):
-        for group in TEST_GROUP_ORDER:
+        for group in self.test_groups():
             self.console.scope = "tests/%s" % group
             task = "tests %s" % group
             aid = self.cfg.groups[group]
@@ -715,10 +733,10 @@ class Seeder(object):
     def step_tags(self):
         self.console.scope = "tags"
         task = "tags"
-        source = self.cfg.groups["SOURCE"]
+        source = self.cfg.groups[self.source_label]
         tags = self._call("global", "list tags", self.api.list_tags, source, True)
-        source_tests = self.tests_in("SOURCE")
-        for key, value, object_type, assign_type, agent_labels, sets in TAG_DEFS:
+        source_tests = self.tests_in(self.source_label) if any(d[5] for d in self.tag_defs) else {}
+        for key, value, object_type, assign_type, agent_labels, sets in self.tag_defs:
             host = "%s=%s" % (key, value)
             found = None
             for tag in tags:
@@ -749,7 +767,7 @@ class Seeder(object):
             for label in agent_labels:
                 wanted.append((self._agent_id_for(label), label))
             for spec in self.plan():
-                if spec.group == "SOURCE" and spec.set_name in sets:
+                if spec.group == self.source_label and spec.set_name in sets:
                     record = source_tests.get(spec.name)
                     if record is None and self.apply:
                         self._line(StepStatus.FAILED, host, task, "test %s not found (run the tests step first)" % spec.name)
@@ -853,9 +871,7 @@ class Seeder(object):
         self.bucket = "deleted" if self.apply else "planned_delete"
         task = "cleanup"
         found_tests, found_rules, found_tags = [], [], []
-        for group in GROUP_LABELS:
-            if group not in self.cfg.groups:
-                continue
+        for group in self.group_labels():
             aid = self.cfg.groups[group]
             self.console.scope = "cleanup/%s" % group
             for record in self._call(group, "list tests", self.api.list_tests, aid):
@@ -868,10 +884,10 @@ class Seeder(object):
             for rule in self._call(group, "list alert rules", self.api.list_alert_rules, aid):
                 if str(rule.get("ruleName", "")).startswith(PREFIX):
                     found_rules.append((group, aid, rule))
-        source = self.cfg.groups["SOURCE"]
-        for tag in self._call("SOURCE", "list tags", self.api.list_tags, source):
-            if (str(tag.get("key")), str(tag.get("value"))) in TAG_PAIRS:
-                found_tags.append(("SOURCE", source, tag))
+        source = self.cfg.groups[self.source_label]
+        for tag in self._call(self.source_label, "list tags", self.api.list_tags, source):
+            if (str(tag.get("key")), str(tag.get("value"))) in self.tag_pairs:
+                found_tags.append((self.source_label, source, tag))
         self.console.scope = "cleanup"
         self.console.info("cleanup", "found %d tests, %d alert rules, %d tags (SBX- names only)" % (
             len(found_tests), len(found_rules), len(found_tags)))
@@ -934,10 +950,13 @@ def parse_steps(text):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="python -m sandbox.seed_sandbox",
+        prog="python -m dev.sandbox.seed_sandbox",
         description="Seed an EMPTY ThousandEyes SANDBOX with SBX- resources. Dry run by default.",
     )
-    parser.add_argument("--map", required=True, help="path of the JSON map file (see sandbox_map.example.json)")
+    parser.add_argument("--map", default=None,
+                        help="path of the JSON map file (see examples/sandbox_map.example.json)")
+    parser.add_argument("--layout", choices=("plan", "generic"), default="plan",
+                        help="plan (default): lab from the scope workbook; generic: the old S1..S6 layout")
     parser.add_argument("--steps", default=None, help="comma list of: %s (default: all)" % ",".join(ALL_STEPS))
     parser.add_argument("--apply", action="store_true", help="send the writes (default: dry run)")
     parser.add_argument("--cleanup", action="store_true",
@@ -946,6 +965,28 @@ def build_parser():
     parser.add_argument("--i-know-this-is-sandbox", dest="sandbox_ack", action="store_true",
                         help="required: confirms that the token and the map belong to a SANDBOX")
     parser.add_argument("--verbose", action="store_true")
+    plan_group = parser.add_argument_group("plan layout (default)")
+    plan_group.add_argument("--xlsx", default=None, help="scope workbook (default: xlsx in the map)")
+    plan_group.add_argument("--prefix-map", dest="prefix_map", default=None,
+                            help="prefix_map.csv (default: prefix_map in the map, else derived from the workbook)")
+    plan_group.add_argument("--plan", default=None, help="read a lab plan JSON file instead of the workbook")
+    plan_group.add_argument("--plan-only", dest="plan_only", action="store_true",
+                            help="print the lab plan summary and stop: no API use, no token, no map needed")
+    plan_group.add_argument("--write-plan", dest="write_plan", default=None, metavar="FILE",
+                            help="write the anonymized lab plan JSON (and the private alias map in --output)")
+    plan_group.add_argument("--vms", type=int, default=None,
+                        help="number of lab VMs (default: 12, or the number of vms in the map if smaller)")
+    plan_group.add_argument("--waves", type=int, default=None,
+                            help="split all READY devices into this many waves; wave 1 = archetype set")
+    plan_group.add_argument("--wave", type=int, default=None, help="wave to seed (default 1; needs --waves)")
+    plan_group.add_argument("--max-tests-per-group", dest="max_tests_per_group", type=int, default=25,
+                            help="scale the tests of each group to at most this number (default: 25)")
+    plan_group.add_argument("--max-calls", dest="max_calls", type=int, default=2000,
+                            help="stop when the run would make more API calls than this (default: 2000; 0 = off)")
+    plan_group.add_argument("--verify", action="store_true",
+                            help="read only: per lab device, check shares and assigned tests against the plan")
+    plan_group.add_argument("--with-clusters", dest="with_clusters", action="store_true",
+                            help="also run the clusters step (OFF by default: the real scope has no clusters)")
     return parser
 
 
@@ -967,11 +1008,16 @@ def main(argv=None, api_factory=None, sleep=time.sleep, stream=None, environ=Non
     environ = os.environ if environ is None else environ
     args = build_parser().parse_args(argv)
     console = SeedConsole(verbose=args.verbose, stream=stream, use_color=False)
+    if args.layout == "plan":
+        from dev.sandbox import lab_seed  # late import: lab_seed imports this module
+        return lab_seed.main_plan(args, console, api_factory, sleep, environ, token_hex)
     seeder = None
     api = None
     try:
         if not args.sandbox_ack:
             raise SafetyGate("the flag --i-know-this-is-sandbox is missing. Refusing to run.")
+        if not args.map:
+            raise SafetyGate("--map is required. Refusing to run.")
         cfg = load_map(args.map)
         steps = parse_steps(args.steps)
         token = _read_token(environ, console)

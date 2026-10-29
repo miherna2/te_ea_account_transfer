@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 try:
-    from tests.test_report_fixtures import build_discovery, SECRET_MARKER
+    from dev.tests.test_report_fixtures import build_discovery, SECRET_MARKER
 except ImportError:
     from test_report_fixtures import build_discovery, SECRET_MARKER
 

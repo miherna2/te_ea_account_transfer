@@ -67,6 +67,19 @@ changed, these are plain attributes, set on every item including blocked ones)
 ``share_sources`` ``{'get_agent': [aid...], 'scan': [aid...]}`` for reports.
 ``owner_assumed`` True when the owner was NOT proven by the API but assumed by the operator
                  (``--owner-is-source``); the dry-run file records ``assumed`` or ``proven``.
+``a2a_targets``  list of dict ``{'aid', 'test_id', 'old_target_agent_id'}``, see "Agent-to-agent tests".
+
+Agent-to-agent tests (``--repoint-agent-to-agent``, ``ctx.repoint_a2a``)
+------------------------------------------------------------------------
+After a move the device gets a NEW agent id. An agent-to-agent test names its target by id
+(``targetAgentId``), so a test that targets the device would break.
+* Flag OFF (default): every device that such a test targets is BLOCKED ("update them first"). A test with
+  no readable ``targetAgentId`` is a warning (it cannot be proven that none targets the device).
+* Flag ON: the device is NOT blocked. Each targeting test is recorded in ``item.a2a_targets`` and ONE warning
+  says "N agent-to-agent test(s) will be repointed after the move". The standalone flow repoints them after the
+  new agent is online, shared and has its tests, and before the old agent is deleted. A test with no readable
+  ``targetAgentId`` becomes a BLOCKER (the repoint cannot be proven safe). A cluster that a2a tests target is a
+  BLOCKER too ("a2a repoint is not supported for clusters").
 
 Target group rules (re-run guard, every device, with or without ``--owner-is-source``)
 -----------------------------------------------------------------------------------
@@ -74,17 +87,37 @@ A device is blocked with "agent is already in the target group (re-run, or owned
 when its id (cluster id for clusters) is listed in the target group, or when the target group is in
 its share set. A device that was legitimately shared with the target before the move is blocked
 too: the operator must unshare it first.
+
+Multi-target runs (inventory v3)
+--------------------------------
+Each inventory row may name its own target group (``target_aid``). The target of a row is the
+row value, else ``ctx.target_aid``. The source group is still one per run. Every item gets
+``target_aid``. An inventory row that lists its target in ``share_aids`` states that the device
+is shared with the target already (the share list comes from the live account group list of the
+device). For such a row the re-run guard above does not block when the owner is proven. A row
+without this statement keeps the guard.
+
+Stale ids and moved devices
+---------------------------
+* The inventory ``agent_id`` is not found in the source group, but one standalone agent matches
+  the inventory name AND IP: that agent is used and a warning says that the inventory id is
+  stale (live id used). Two such agents block the item.
+* The device is not in the source group (no id match, no name and IP match) and the target group
+  has an ONLINE agent with the same name AND IP whose id is not a source id: the device is already
+  migrated. The item gets the status ``skipped`` (not a blocker, not ready). Two such agents in
+  the target group block the item.
 """
 import ipaddress
 
 from te_agent_migrate.errors import ApiError
 from te_agent_migrate.models import StepStatus
 from te_agent_migrate.output import mask_secrets
-from te_agent_migrate.strategy_d.context import PreflightItem
+from te_agent_migrate.strategy_d.context import PreflightItem, item_target_aid
 
 STATUS_READY = 'ready'
 STATUS_BLOCKED = 'blocked'
 STATUS_EXCLUDED = 'excluded'
+STATUS_SKIPPED = 'skipped'
 
 AGENT_TAG_TYPES = ('v-agent', 'agent', 'enterprise-agent', 'cluster')
 OWNER_KEYS = ('ownerAid', 'ownerAccountGroupId')
@@ -216,6 +249,26 @@ class _Groups(object):
 
 
 # ------------------------------------------------------------------ resolution
+def _inv_target(ctx, inv):
+    return str(getattr(inv, 'target_aid', None) or ctx.target_aid)
+
+
+def _live_by_name_ip(inv, records):
+    """Standalone records that match the inventory name AND IP."""
+    if inv.is_cluster or not str(inv.ip_address or '').strip() or not _norm_name(inv.hostname):
+        return []
+    return [r for r in records
+            if not r.is_cluster and _ip_matches(inv.ip_address, r) and _name_matches(inv.hostname, r)]
+
+
+def _id_unknown(inv, records):
+    """True when the inventory row has an agent_id that no record in ``records`` has."""
+    if not inv.agent_id:
+        return False
+    wanted = str(inv.agent_id).strip()
+    return not any(str(r.agent_id) == wanted for r in records)
+
+
 def _mismatch(inv, record):
     actual = 'cluster' if record.is_cluster else 'standalone agent'
     wanted = 'cluster' if inv.is_cluster else 'standalone agent'
@@ -461,14 +514,21 @@ def _is_a2a(test):
 
 
 def _target_agent_id(test):
+    """Plain text id of ``targetAgentId``, or None when it is missing or not a plain id (dict, list, bool, empty)."""
     value = test.raw.get('targetAgentId')
-    if value is None or isinstance(value, bool) or not str(value).strip():
+    if value is None or isinstance(value, (bool, dict, list, tuple)) or not str(value).strip():
         return None
     return str(value).strip()
 
 
-def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, is_cluster=False):
-    """Read tests once per group. Return test_enabled; fill warnings and blocked."""
+def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, is_cluster=False,
+                 repoint_a2a=False, a2a_out=None):
+    """Read tests once per group. Return test_enabled; fill warnings and blocked.
+
+    ``repoint_a2a`` True: agent-to-agent tests that target the device are not a blocker for a standalone
+    agent. They are appended to ``a2a_out`` as dict {aid, test_id, old_target_agent_id} (the caller adds the
+    warning). An unreadable ``targetAgentId`` and a cluster target are blockers then. See the module docstring.
+    """
     agent_id = str(agent_id)
     test_enabled = {}
     for aid in share_aids:
@@ -478,6 +538,11 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
         except ApiError as exc:
             warnings.append('could not read tests in group %s (enabled flags, agent targets and last-agent '
                             'tests not checked): %s' % (aid, _err(exc)))
+            if repoint_a2a:
+                # An agent-to-agent test in this group could use the device as target. Without the list,
+                # the repoint cannot be proven complete, and the old agent is deleted at the end.
+                blocked.append('cannot read tests in group %s; the agent-to-agent repoint cannot be proven '
+                               'complete: %s' % (aid, _err(exc)))
             test_enabled[aid] = dict((t, None) for t in wanted)
             continue
         by_id = dict((str(t.test_id), t) for t in listing)
@@ -507,11 +572,21 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
                 unreadable_targets += 1
             elif target == agent_id:
                 targeting.append(str(test.test_id))
-        if targeting:
+        if targeting and repoint_a2a and is_cluster:
+            blocked.append('a2a repoint is not supported for clusters (%d agent-to-agent test(s) in group %s '
+                           'use this cluster as target agent): %s' % (len(targeting), aid, _ids_text(targeting)))
+        elif targeting and repoint_a2a:
+            for test_id in targeting:
+                if a2a_out is not None:
+                    a2a_out.append({'aid': str(aid), 'test_id': test_id, 'old_target_agent_id': agent_id})
+        elif targeting:
             blocked.append('%d agent-to-agent test(s) in group %s use this device as target agent '
                            '(the agent id changes, update them first): %s'
                            % (len(targeting), aid, _ids_text(targeting)))
-        if unreadable_targets:
+        if unreadable_targets and repoint_a2a:
+            blocked.append('%d agent-to-agent test(s) in group %s have no readable targetAgentId; the '
+                           'repoint cannot be proven safe' % (unreadable_targets, aid))
+        elif unreadable_targets:
             warnings.append('%d agent-to-agent test(s) in group %s have no readable targetAgentId; cannot '
                             'prove that none targets this device' % (unreadable_targets, aid))
 
@@ -565,7 +640,7 @@ def _family_problem(members):
 # ------------------------------------------------------------------- main flow
 def _item(inv, status, reasons=None, record=None, owner_aid='', share_aids=None, tests_by_aid=None,
           tags=None, members=None, warnings=None, test_enabled=None, owner_proven=False, share_sources=None,
-          owner_assumed=False):
+          owner_assumed=False, a2a_targets=None):
     item = PreflightItem(
         inv, record=record, status=status, reasons=reasons, owner_aid=owner_aid,
         share_aids=share_aids, tests_by_aid=tests_by_aid, tags=tags, members=members,
@@ -575,6 +650,7 @@ def _item(inv, status, reasons=None, record=None, owner_aid='', share_aids=None,
     item.test_enabled = dict((str(k), dict(v)) for k, v in (test_enabled or {}).items())
     item.owner_proven = bool(owner_proven)
     item.owner_assumed = bool(owner_assumed)
+    item.a2a_targets = [dict(t) for t in (a2a_targets or [])]
     item.share_sources = dict(share_sources or {'get_agent': [], 'scan': []})
     if status == STATUS_READY:
         for text in item.warnings:
@@ -586,9 +662,51 @@ def _blocked(inv, reasons, record=None, warnings=None, **extra):
     return _item(inv, STATUS_BLOCKED, reasons=reasons, record=record, warnings=warnings, **extra)
 
 
+def _already_migrated(inv, groups, target, source_records):
+    """Online standalone agents in the target group with the inventory name AND IP and a non-source id."""
+    try:
+        target_agents = groups.agents(target)
+    except ApiError:
+        return []  # the normal path reports the unreadable target group
+    source_ids = set(str(r.agent_id) for r in source_records)
+    return [t for t in _live_by_name_ip(inv, target_agents)
+            if t.online and str(t.agent_id) not in source_ids]
+
+
+def _lookup(inv, groups, source, target, source_records, run_warnings):
+    """Find the device in the source group. Return (record, problem, warnings, done_item).
+
+    ``done_item`` is a finished PreflightItem (skipped or blocked) or None.
+    """
+    live = _live_by_name_ip(inv, source_records)
+    unknown_id = _id_unknown(inv, source_records)
+    if not inv.is_cluster and not live and (unknown_id or not inv.agent_id):
+        moved = _already_migrated(inv, groups, target, source_records)
+        if len(moved) == 1:
+            reason = ('already migrated: agent id %s is online in target group %s; the device is not in '
+                      'the source group' % (moved[0].agent_id, target))
+            return None, None, [], _item(inv, STATUS_SKIPPED, reasons=[reason], warnings=run_warnings)
+        if len(moved) > 1:
+            reason = ('%d online agents in target group %s match the name and IP (ids %s); the device may be '
+                      'migrated already, resolve the duplicate first'
+                      % (len(moved), target, ', '.join(sorted(str(t.agent_id) for t in moved))))
+            return None, None, [], _blocked(inv, [reason], warnings=run_warnings)
+    if unknown_id and not inv.is_cluster and live:
+        if len(live) > 1:
+            reason = ('agent_id %s is not in the source group and %d live agents match name and IP '
+                      '(ambiguous): %s' % (inv.agent_id, len(live), ', '.join(sorted(str(r.agent_id) for r in live))))
+            return None, None, [], _blocked(inv, [reason], warnings=run_warnings)
+        stale = 'inventory agent_id %s is stale; using live id %s' % (inv.agent_id, live[0].agent_id)
+        return live[0], None, [stale], None
+    record, problem, warnings = _resolve(inv, source_records)
+    return record, problem, warnings, None
+
+
 def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner_source=False):
     source = str(ctx.source_aid)
-    target = str(ctx.target_aid)
+    target = _inv_target(ctx, inv)
+    # the inventory row states that the device is shared with the target already
+    expected_in_target = bool(getattr(inv, 'target_aid', None)) and target in list(getattr(inv, 'share_aids', None) or [])
 
     if source == target:
         return _blocked(inv, ['source and target account group are the same (%s)' % source])
@@ -598,7 +716,9 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
     except ApiError as exc:
         return _blocked(inv, ['cannot read agents of the source group %s: %s' % (source, _err(exc))])
 
-    record, problem, warnings = _resolve(inv, source_records)
+    record, problem, warnings, done = _lookup(inv, groups, source, target, source_records, run_warnings)
+    if done is not None:
+        return done
     warnings = list(warnings) + list(run_warnings)
     if problem:
         return _blocked(inv, [problem], record=record, warnings=warnings)
@@ -656,7 +776,7 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         )
 
     # the device is already listed in the target group: a re-run, or owned by the target
-    if any(str(t.agent_id) == agent_id for t in target_agents):
+    if not expected_in_target and any(str(t.agent_id) == agent_id for t in target_agents):
         return _blocked(
             inv, ['%s; %s' % (REASON_IN_TARGET, REASON_IN_TARGET_HINT)],
             record=record, warnings=warnings, members=members,
@@ -667,7 +787,7 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
     warnings.extend(sharing['warnings'])
     shared_to_target = (target in sharing['sources'].get('get_agent', [])
                         or target in sharing['share_aids'])
-    if shared_to_target:
+    if shared_to_target and not expected_in_target:
         return _blocked(
             inv, list(sharing['blocked']) + ['%s; %s' % (REASON_IN_TARGET, REASON_IN_TARGET_HINT)],
             record=record, warnings=warnings, members=members,
@@ -682,19 +802,29 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         )
     share_aids = sharing['share_aids']
 
+    unseen = [a for a in getattr(inv, 'share_aids', None) or [] if a not in share_aids and a != target]
+    if unseen:
+        warnings.append('inventory share_aids %s do not see the agent now; they will be added'
+                        % _aids_text(unseen))
+
     tests_by_aid = {}
     for aid in share_aids:
         listed = record if aid == source else sharing['listing'].get(aid)
         tests_by_aid[aid] = list(listed.test_ids) if listed is not None else []
 
     blocked = []
+    a2a_targets = []
     test_enabled = _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked,
-                                is_cluster=bool(record.is_cluster))
+                                is_cluster=bool(record.is_cluster),
+                                repoint_a2a=bool(getattr(ctx, 'repoint_a2a', False)), a2a_out=a2a_targets)
+    if a2a_targets and not blocked:
+        warnings.append('%d agent-to-agent test(s) will be repointed after the move' % len(a2a_targets))
     if blocked:
         return _blocked(
             inv, blocked, record=record, warnings=warnings, members=members, owner_aid=source,
             share_aids=share_aids, tests_by_aid=tests_by_aid, test_enabled=test_enabled,
             owner_proven=True, share_sources=sharing['sources'], owner_assumed=sharing['owner_assumed'],
+            a2a_targets=a2a_targets,
         )
 
     tags = _tags_for(groups, share_aids, agent_id, warnings)
@@ -703,14 +833,15 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         inv, STATUS_READY, record=record, owner_aid=source, share_aids=share_aids,
         tests_by_aid=tests_by_aid, tags=tags, members=members, warnings=warnings,
         test_enabled=test_enabled, owner_proven=True, share_sources=sharing['sources'],
-        owner_assumed=sharing['owner_assumed'],
+        owner_assumed=sharing['owner_assumed'], a2a_targets=a2a_targets,
     )
 
 
-def _scan_groups(ctx, all_aids):
+def _scan_groups(ctx, all_aids, inventory_agents=()):
     """Return (sorted aid list, run-level warnings)."""
     warnings = []
     aids = set([str(ctx.source_aid), str(ctx.target_aid)])
+    aids.update(str(a.target_aid) for a in inventory_agents if getattr(a, 'target_aid', None))
     if all_aids is not None:
         aids.update(str(a) for a in all_aids)
     else:
@@ -732,11 +863,14 @@ def run_preflight(ctx, inventory_agents, all_aids=None, assume_owner_source=Fals
     names another group still blocks.
     """
     groups = _Groups(ctx.api)
-    scan_aids, run_warnings = _scan_groups(ctx, all_aids)
+    inventory_agents = list(inventory_agents)
+    scan_aids, run_warnings = _scan_groups(ctx, all_aids, inventory_agents)
     seen_ids = {}
     items = []
     for inv in inventory_agents:
-        items.append(_check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner_source))
+        item = _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner_source)
+        item.target_aid = _inv_target(ctx, inv)
+        items.append(item)
     return items
 
 
@@ -748,10 +882,14 @@ def _total_tests(item):
 def _detail(item):
     if item.status == STATUS_BLOCKED:
         return 'blocked: ' + '; '.join(item.reasons)
+    if item.status == STATUS_SKIPPED:
+        return 'skipped: ' + '; '.join(item.reasons)
     kind = 'cluster' if item.inventory.is_cluster else 'agent'
     parts = ['%s' % kind, 'tests=%d' % _total_tests(item), 'shares=%d' % len(item.share_aids)]
     if item.inventory.is_cluster:
         parts.append('members=%d' % len(item.members))
+    if getattr(item, 'a2a_targets', None):
+        parts.append('a2a repoint=%d' % len(item.a2a_targets))
     text = ', '.join(parts)
     # warnings are printed as info lines, not here
     others = [r for r in item.reasons if not r.startswith('warning:')]
@@ -768,35 +906,60 @@ def _owner_text(item):
     return 'not proven'
 
 
-def print_preflight(ctx, items):
-    ctx.console.task('Preflight')
-    info = getattr(ctx.console, 'info', None)
+def group_by_target(ctx, items):
+    """Return [(target aid, [item, ...])]. Targets in order of first use, items in their own order."""
+    order = []
+    members = {}
     for item in items:
-        if item.status == STATUS_BLOCKED:
-            status = StepStatus.FAILED
-        elif item.status == STATUS_EXCLUDED:
-            status = StepStatus.SKIPPED
-        else:
-            status = StepStatus.OK
-        ctx.console.status(status, item.name, '', _detail(item))
-        if info is None:
-            continue
-        sources = getattr(item, 'share_sources', None) or {}
-        if item.share_aids:
-            share_text = _aids_text(item.share_aids)
-        elif sources.get('get_agent') or sources.get('scan'):
-            share_text = 'disagree (get_agent=%s, scan=%s)' % (
-                _aids_text(sources.get('get_agent', [])), _aids_text(sources.get('scan', [])))
-        else:
-            share_text = 'unknown'
-        if item.record is not None:
-            info(item.name, 'owner=%s shares=%s' % (_owner_text(item), share_text))
-        for text in getattr(item, 'warnings', []):
-            info(item.name, 'warning: ' + text)
+        aid = item_target_aid(ctx, item)
+        if aid not in members:
+            members[aid] = []
+            order.append(aid)
+        members[aid].append(item)
+    return [(aid, members[aid]) for aid in order]
+
+
+def _print_item(ctx, item):
+    info = getattr(ctx.console, 'info', None)
+    if item.status == STATUS_BLOCKED:
+        status = StepStatus.FAILED
+    elif item.status in (STATUS_EXCLUDED, STATUS_SKIPPED):
+        status = StepStatus.SKIPPED
+    else:
+        status = StepStatus.OK
+    ctx.console.status(status, item.name, '', _detail(item))
+    if info is None:
+        return
+    sources = getattr(item, 'share_sources', None) or {}
+    if item.share_aids:
+        share_text = _aids_text(item.share_aids)
+    elif sources.get('get_agent') or sources.get('scan'):
+        share_text = 'disagree (get_agent=%s, scan=%s)' % (
+            _aids_text(sources.get('get_agent', [])), _aids_text(sources.get('scan', [])))
+    else:
+        share_text = 'unknown'
+    if item.record is not None:
+        info(item.name, 'owner=%s shares=%s' % (_owner_text(item), share_text))
+    for text in getattr(item, 'warnings', []):
+        info(item.name, 'warning: ' + text)
+
+
+def print_preflight(ctx, items):
+    """Print one line per device. With more than one target group the lines are grouped by target."""
+    groups = group_by_target(ctx, items)
+    if len(groups) <= 1:
+        ctx.console.task('Preflight')
+        for item in items:
+            _print_item(ctx, item)
+        return
+    for aid, members in groups:
+        ctx.console.task('Preflight -> Target %s' % ctx.target_label(aid))
+        for item in members:
+            _print_item(ctx, item)
 
 
 def summarize(items):
-    counts = {STATUS_READY: 0, STATUS_BLOCKED: 0, STATUS_EXCLUDED: 0}
+    counts = {STATUS_READY: 0, STATUS_BLOCKED: 0, STATUS_EXCLUDED: 0}  # 'skipped' appears when used
     for item in items:
         counts[item.status] = counts.get(item.status, 0) + 1
     return counts

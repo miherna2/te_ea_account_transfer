@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 try:
-    from tests.test_report_fixtures import SECRET_MARKER, build_discovery, write_selection
+    from dev.tests.test_report_fixtures import SECRET_MARKER, build_discovery, write_selection
 except ImportError:
     from test_report_fixtures import SECRET_MARKER, build_discovery, write_selection
 

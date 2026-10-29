@@ -448,7 +448,7 @@ class BindingTests(CliTestBase):
         self.make_dry_run(bound_preflight(shares={"EA-ONE": ["9x", "1"][::-1], "CL-ONE": ["1", "5"]},
                                           owner_assumed=("CL-ONE",)), argv=["--owner-is-source"])
         data = json.loads(self.dry_run_file().read_text(encoding="utf-8"))
-        self.assertEqual(data["schema_version"], 2)
+        self.assertEqual(data["schema_version"], 4)
         self.assertTrue(data["owner_is_source"])
         self.assertEqual(data["excluded_ids"], ["12"])
         ready = dict((entry["name"], entry) for entry in data["ready"])

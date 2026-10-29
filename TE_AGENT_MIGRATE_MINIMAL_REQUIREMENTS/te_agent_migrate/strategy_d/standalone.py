@@ -8,13 +8,26 @@ only after the new agent is online, shared, and the tests are verified.
 Dry run (``ctx.apply`` False) sends no write call and opens no agent UI. It does
 run the GET-only checks of apply (clean target group), so both modes give the
 same verdict.
+
+Agent-to-agent tests (``--repoint-agent-to-agent``)
+---------------------------------------------------
+The new agent has a NEW id. An agent-to-agent test names its target agent by id, so a test that targets the
+device must be pointed at the new id. Preflight records such tests in ``item.a2a_targets`` (only when the flag
+is on). When the list is not empty, the step ``repoint a2a targets`` runs after the tests are assigned and
+verified and BEFORE the old agent is deleted. For each recorded test it calls
+``ctx.api.set_agent_to_agent_target(test_id, new_id, aid, old_target_agent_id)``. If one call fails, the flow
+raises ``FlowAborted``: the new agent stays online, the old agent is NOT deleted, and the message lists the
+test ids that were repointed and the ones that were not. The snapshot file holds ``a2a_targets`` with the old
+target ids, so an operator can undo the change by hand. A dry run prints the step with the test count and sends
+no write.
 """
 from contextlib import contextmanager
 
 from te_agent_migrate.api_client import AmbiguousAgentMatch, ThousandEyesApiClient
 from te_agent_migrate.errors import AuthenticationError, UiError, VisibilityTimeout
 from te_agent_migrate.models import StepStatus
-from te_agent_migrate.strategy_d.context import FlowAborted, FlowResult, attach_stop_info
+from te_agent_migrate.output import mask_secrets
+from te_agent_migrate.strategy_d.context import FlowAborted, FlowResult, a2a_targets_of, attach_stop_info
 from te_agent_migrate.ui_client import boolean_from_snapshot
 
 STEP_PREFLIGHT = 'preflight_snapshot'
@@ -27,6 +40,7 @@ STEP_UI_TOKEN = 'ui_set_target_token'
 STEP_TARGET_ONLINE = 'api_target_online'
 STEP_SHARE_BACK = 'api_share_back'
 STEP_ASSIGN_TESTS = 'api_assign_tests'
+STEP_REPOINT_A2A = 'repoint a2a targets'
 STEP_DELETE_OLD = 'api_delete_old'
 STEP_RENAME = 'api_rename'
 STEP_RESTORE_TAGS = 'api_restore_tags'
@@ -41,6 +55,8 @@ STATE_TOKEN = 'agent was reset and the target token was submitted; old agent is 
 STATE_ONLINE = 'new agent is online in the target group; old agent is still present; no test was changed'
 STATE_SHARED = 'new agent is online and shared; old agent is still present; tests may be partly assigned'
 STATE_VERIFIED = 'new agent is online, shared, tests verified; old agent is still present'
+STATE_A2A_DONE = ('new agent is online, shared, tests verified, agent-to-agent tests repointed; '
+                  'old agent is still present')
 STATE_DELETE_SENT = ('delete sent, not confirmed; the old agent may or may not be deleted; '
                      'new agent is online, shared, tests verified')
 STATE_DELETED = 'old agent deleted; new agent is online and serves the tests; name or tags may be incomplete'
@@ -90,11 +106,21 @@ def _test_aids(item):
 
 
 def _desired_groups(item, target_aid):
-    """Full share list: target first, then every group that saw the agent or holds tests."""
+    """Full share list, never empty when a target is set.
+
+    Order: the target, the inventory share list (column order), every group that sees the agent
+    now (sorted), every group that holds tests. Duplicates are dropped.
+    """
     wanted = [str(target_aid)] if target_aid not in (None, '') else []
+    wanted.extend(str(a) for a in (getattr(getattr(item, 'inventory', None), 'share_aids', None) or []))
     wanted.extend(sorted((str(a) for a in item.share_aids), key=_aid_key))
     wanted.extend(_test_aids(item))
     return _unique(wanted)
+
+
+def desired_share_aids(item, target_aid):
+    """Public name of the share list the flow sends. The dry-run file binds it."""
+    return _desired_groups(item, target_aid)
 
 
 def _format_aids(aids):
@@ -125,6 +151,11 @@ def _assign_text(item):
     for aid in _test_aids(item):
         parts.append('%d tests in aid %s' % (len(item.tests_by_aid[aid]), aid))
     return ', '.join(parts)
+
+
+def _a2a_text(entries):
+    """'test 70 (aid 100), test 71 (aid 200)': ids only."""
+    return ', '.join('%s (aid %s)' % (e['test_id'], e['aid']) for e in entries)
 
 
 def plan_standalone(item, target_aid=None):
@@ -160,6 +191,11 @@ def plan_standalone(item, target_aid=None):
         plan.append((STEP_ASSIGN_TESTS, 'assign %s, then verify each test list' % assign))
     else:
         plan.append((STEP_ASSIGN_TESTS, 'no tests to assign'))
+    a2a = a2a_targets_of(item)
+    if a2a:
+        plan.append((STEP_REPOINT_A2A,
+                     'repoint %d agent-to-agent test(s) from old agent id %s to the new agent id (tests %s); '
+                     'stop and keep the old agent if one fails' % (len(a2a), old_id, _a2a_text(a2a))))
     plan.append((STEP_DELETE_OLD,
                  'delete old agent %s in aid %s after share and tests are verified; wait until absent'
                  % (old_id, owner)))
@@ -357,6 +393,47 @@ def _assign_tests(ctx, item, new_id):
                 missing = sorted(needed - have)
                 raise FlowAborted('aid %s: %d of %d tests are not assigned to agent %s (%s); old agent was NOT deleted'
                                   % (aid, len(missing), len(needed), new_id, ','.join(missing[:10])))
+
+
+def _a2a_state(new_id, old_id, done, pending):
+    """State text while agent-to-agent tests are repointed. Ids only."""
+    return ('new agent %s is online, shared, tests verified; old agent %s is still present and was NOT deleted; '
+            'a2a tests repointed: [%s]; not repointed: [%s]'
+            % (new_id, old_id, ', '.join(done), ', '.join(pending)))
+
+
+def _repoint_a2a(ctx, item, old_id, new_id, state):
+    """Point every recorded agent-to-agent test at the new agent. Return how many tests now target it.
+
+    Runs only when ``item.a2a_targets`` is not empty. The old agent is still present. A failure raises
+    ``FlowAborted`` (the old agent is kept). A test that already targets the new id counts as repointed.
+    """
+    entries = a2a_targets_of(item)
+    if not entries:
+        return 0
+    labels = ['%s/%s' % (e['aid'], e['test_id']) for e in entries]
+    done = []
+    detail = 'repointed %d agent-to-agent test(s) to agent %s' % (len(entries), new_id)
+    with ctx.step(item.name, STEP_REPOINT_A2A, detail, changed=True):
+        for entry, label in zip(entries, labels):
+            pending = [l for l in labels if l not in done]
+            state[0] = _a2a_state(new_id, old_id, done, pending)
+            try:
+                result = ctx.api.set_agent_to_agent_target(
+                    entry['test_id'], new_id, entry['aid'], entry['old_target_agent_id'])
+            except Exception as exc:  # any failure: stop, keep the old agent, say what is done
+                pending = [l for l in labels if l not in done]
+                raise FlowAborted(
+                    'a2a repoint failed for test %s in aid %s: %s; new agent %s is online; old agent %s was NOT '
+                    'deleted; repointed tests (aid/test): [%s]; not repointed: [%s]'
+                    % (entry['test_id'], entry['aid'], mask_secrets(str(exc)) or exc.__class__.__name__,
+                       new_id, old_id, ', '.join(done), ', '.join(pending)))
+            done.append(label)
+            if result == 'already':
+                ctx.console.info(item.name, 'a2a test %s in aid %s already targets agent %s; no write'
+                                 % (entry['test_id'], entry['aid'], new_id))
+    state[0] = STATE_A2A_DONE
+    return len(done)
 
 
 def _delete_type(ctx, owner, record, old_id):
@@ -564,6 +641,7 @@ def _run(ctx, item, host, state):
     state[0] = STATE_SHARED
     _assign_tests(ctx, item, new_id)
     state[0] = STATE_VERIFIED
+    repointed = _repoint_a2a(ctx, item, old_id, new_id, state)
 
     _delete_old(ctx, item, old_id, new_id, state)
     state[0] = STATE_DELETED
@@ -572,5 +650,8 @@ def _run(ctx, item, host, state):
     _restore_tags(ctx, item, new_id, warnings)
     ctx.skipped(host, STEP_MANUAL_RULES, MANUAL_RULES_TEXT)
     state[0] = 'done'
-    return FlowResult(host, True, 'migrated: old agent %s -> new agent %s' % (old_id, new_id),
+    detail = 'migrated: old agent %s -> new agent %s' % (old_id, new_id)
+    if repointed:
+        detail += '; %d a2a test(s) repointed' % repointed
+    return FlowResult(host, True, detail,
                       new_agent_id=new_id, warnings=warnings, snapshot=ctx.snapshot_path)

@@ -101,6 +101,20 @@ class MigrationConsole(object):
             self._write(" Every selected device will register in the TARGET above.")
             self._write("!" * 72 + "\n")
 
+    def targets_banner(self, source, targets, mode, destructive=False):
+        """Banner for a run with several target groups. ``targets`` is a list of (label, device count)."""
+        title = "DESTRUCTIVE MIGRATION DESTINATIONS" if destructive else "MIGRATION DESTINATIONS"
+        mode_text = str(getattr(mode, "value", mode)).upper()
+        with self._lock:
+            self._write("\n" + "!" * 72)
+            self._write(" %s" % title)
+            self._write(" SOURCE ACCOUNT GROUP: %s [%s]" % (source.name, source.aid))
+            self._write(" MODE: %s" % mode_text)
+            for label, count in targets:
+                self._write(" TARGET ACCOUNT GROUP: %s (%d device(s) in the inventory)" % (label, count))
+            self._write(" Each device registers in the TARGET named in its inventory row.")
+            self._write("!" * 72 + "\n")
+
     # ------------------------------------------------------------------ play / task
     def play(self, title, mode, strategy):
         mode_text = str(getattr(mode, "value", mode)).upper()
@@ -172,13 +186,33 @@ class MigrationConsole(object):
             if rows:
                 self._write("\nRun summary")
                 self._write("-" * LINE_WIDTH)
+                labels = []
                 for row in rows:
-                    status = row.get("status", "")
-                    status = getattr(status, "value", status)
-                    self._write(
-                        "%s | %s | %s"
-                        % (row.get("agent", ""), status, self._clean(row.get("detail", "")))
-                    )
+                    label = row.get("target")
+                    if label and label not in labels:
+                        labels.append(label)
+                if not labels:
+                    self._write_rows(rows)
+                    return
+                # one block per target group; rows without a target (run-level) come first
+                self._write_rows([row for row in rows if not row.get("target")])
+                for label in labels:
+                    block = [row for row in rows if row.get("target") == label]
+                    counts = {}
+                    for row in block:
+                        key = self._status_key(row.get("status", ""))
+                        counts[key] = counts.get(key, 0) + 1
+                    summary = " ".join("%s=%d" % (key, counts[key]) for key in sorted(counts))
+                    self._write("Target %s: %s" % (self._clean(label), summary))
+                    self._write_rows(block)
+
+    def _write_rows(self, rows):
+        for row in rows:
+            status = row.get("status", "")
+            status = getattr(status, "value", status)
+            self._write(
+                "%s | %s | %s" % (row.get("agent", ""), status, self._clean(row.get("detail", "")))
+            )
 
     @staticmethod
     def _recap_color(name, value):

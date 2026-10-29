@@ -31,6 +31,10 @@ class AmbiguousAgentMatch(ApiError):
         self.agent_ids = list(agent_ids or [])
 
 
+class A2aTargetChanged(ApiError):
+    """The target agent of an agent-to-agent test is not the expected old id. Nothing was written."""
+
+
 def retry_after_seconds(value, fallback):
     """Seconds to wait from a Retry-After header: decimals allowed, capped at 60. Bad value -> fallback."""
     try:
@@ -729,17 +733,17 @@ class ThousandEyesApiClient(object):
             expected=set((200, 201, 204)),
         )
 
-    def set_test_enabled(self, aid, test_type, test_id, enabled):
-        """Set only the ``enabled`` flag of one test (read, change one field, PUT the full payload).
+    def _full_put_payload(self, test):
+        """Build the body of a full-payload PUT from a test read with ``get_test``.
 
         Response-only fields are dropped. Expanded objects (agents, tags, alert
         rules, monitors, shared accounts) are reduced to the id forms a PUT accepts.
-        Lab check: a PUT with this payload must not change anything else on the test.
+        The caller changes the one field it wants to change and sends the result with ``update_test``.
+        Shared by ``set_test_enabled`` and ``set_agent_to_agent_target``.
         """
         from copy import deepcopy
         from te_agent_migrate.strategies import RESPONSE_ONLY_FIELDS  # late import: strategies imports this module
 
-        test = self.get_test(aid, test_type, test_id)
         payload = deepcopy(test.raw)
         for field in RESPONSE_ONLY_FIELDS:
             payload.pop(field, None)
@@ -772,8 +776,85 @@ class ThousandEyesApiClient(object):
                 if value is not None and str(value):
                     shares.append({"aid": int(value) if str(value).isdigit() else str(value)})
             payload["sharedWithAccounts"] = shares
+        return payload
+
+    def set_test_enabled(self, aid, test_type, test_id, enabled):
+        """Set only the ``enabled`` flag of one test (read, change one field, PUT the full payload).
+
+        Response-only fields are dropped. Expanded objects (agents, tags, alert
+        rules, monitors, shared accounts) are reduced to the id forms a PUT accepts.
+        Lab check: a PUT with this payload must not change anything else on the test.
+        """
+        test = self.get_test(aid, test_type, test_id)
+        payload = self._full_put_payload(test)
         payload["enabled"] = bool(enabled)
         return self.update_test(aid, test_type, test_id, payload)
+
+    @staticmethod
+    def _scalar_id(value):
+        """Text of a plain id value (str or int). Anything else (None, bool, dict, list, empty) -> None."""
+        if value is None or isinstance(value, (bool, dict, list, tuple)):
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def set_agent_to_agent_target(self, test_id, new_agent_id, aid, expected_old_agent_id):
+        """Point one agent-to-agent test at a new target agent. Change ONLY ``targetAgentId``.
+
+        UNVERIFIED against a real API (lab check): endpoint ``tests/agent-to-agent/{test_id}?aid=<aid>``
+        (GET, then PUT of the full payload), field ``targetAgentId`` (scalar id).
+
+        Steps:
+        1. GET the test. Its ``targetAgentId`` must be a plain id, else ``ApiError`` (nothing written).
+        2. Target already equals ``new_agent_id`` -> return ``'already'`` (no write).
+        3. Target differs from ``expected_old_agent_id`` -> raise ``A2aTargetChanged`` (someone changed it;
+           nothing written).
+        4. PUT the full payload (same builder and same PUT as ``set_test_enabled``: response-only fields
+           dropped, expanded objects reduced to ids, 429-only write retry) with only ``targetAgentId`` changed.
+        5. GET again. ``targetAgentId`` must be the new id, and ``enabled`` and the source agent ids must be
+           the same as before the PUT, else ``ApiError``. Return ``'changed'``.
+
+        Messages carry ids only, never payload values.
+        """
+        test_type = "agent-to-agent"
+        test_id, new_id, old_id = str(test_id), str(new_agent_id), str(expected_old_agent_id)
+        if new_id == old_id:
+            raise ApiError("a2a test %s: the new target id equals the old id (%s); nothing written" % (test_id, old_id))
+        before = self.get_test(aid, test_type, test_id)
+        self._require_a2a(before, test_id)
+        current = self._scalar_id(before.raw.get("targetAgentId"))
+        if current is None:
+            raise ApiError(
+                "a2a test %s in aid %s has no readable targetAgentId; nothing written" % (test_id, aid)
+            )
+        if current == new_id:
+            return "already"
+        if current != old_id:
+            raise A2aTargetChanged(
+                "a2a test %s in aid %s: targetAgentId is %s, expected old id %s; someone changed it; "
+                "nothing written" % (test_id, aid, current, old_id)
+            )
+        payload = self._full_put_payload(before)
+        payload["targetAgentId"] = new_id
+        self.update_test(aid, test_type, test_id, payload)
+        after = self.get_test(aid, test_type, test_id)
+        found = self._scalar_id(after.raw.get("targetAgentId"))
+        if found != new_id:
+            raise ApiError(
+                "a2a test %s in aid %s: after the PUT targetAgentId is %s, expected %s"
+                % (test_id, aid, found or "unreadable", new_id)
+            )
+        if bool(after.raw.get("enabled", True)) != bool(before.raw.get("enabled", True)):
+            raise ApiError("a2a test %s in aid %s: the enabled flag changed during the PUT" % (test_id, aid))
+        if self._test_agent_ids(after) != self._test_agent_ids(before):
+            raise ApiError("a2a test %s in aid %s: the source agent list changed during the PUT" % (test_id, aid))
+        return "changed"
+
+    @staticmethod
+    def _require_a2a(test, test_id):
+        kind = str(test.raw.get("type", test.raw.get("testType", "agent-to-agent"))).lower()
+        if "agent-to-agent" not in kind:
+            raise ApiError("test %s is not an agent-to-agent test (type %s); nothing written" % (test_id, kind))
 
     def set_test_enabled_minimal(self, aid, test_type, test_id, enabled):
         """EXPERIMENTAL (lab check 7): PUT only ``{"enabled": <bool>}``, no other field.

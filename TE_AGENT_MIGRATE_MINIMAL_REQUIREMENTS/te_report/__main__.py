@@ -17,7 +17,7 @@ def build_parser():
         prog="python -m te_report",
         description="Offline relationship graph and migration impact report.",
     )
-    parser.add_argument("--input", required=True, help="discovery_output directory")
+    parser.add_argument("--input", required=True, help="discovery directory (work/discovery)")
     parser.add_argument("--selection", help="text file: one agent id / name / IP per line")
     parser.add_argument("--output", required=True, help="directory for graph.json and CSV files")
     parser.add_argument("--html", action="store_true", help="also write report.html (one self-contained page)")

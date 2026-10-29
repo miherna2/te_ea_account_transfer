@@ -146,7 +146,10 @@ class InventoryV2Tests(unittest.TestCase):
         self.assertFalse(agent.is_cluster)
         self.assertEqual(
             agent.to_dict(),
-            {"hostname": "TE1", "ip_address": "192.0.2.1", "kind": "agent", "agent_id": None},
+            {
+                "hostname": "TE1", "ip_address": "192.0.2.1", "kind": "agent", "agent_id": None,
+                "target_aid": None, "share_aids": [],
+            },
         )
         self.assertEqual(agent, InventoryAgent("TE1", "192.0.2.1", kind="agent"))
         self.assertNotEqual(agent, InventoryAgent("TE1", "192.0.2.1", kind="cluster"))

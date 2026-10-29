@@ -4,10 +4,8 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import traceback
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,8 +19,15 @@ from te_agent_migrate.operator import OperatorPrompter
 from te_agent_migrate.output import MigrationConsole, mask_secrets
 from te_agent_migrate.redaction import redact_value
 from te_agent_migrate.reporting import RunReport
-from te_agent_migrate.strategy_d.context import FlowAborted, FlowContext
+from te_agent_migrate.strategy_d.context import FlowAborted, FlowContext, a2a_targets_of, item_target_aid
 from te_agent_migrate.strategy_d.runner import run_strategy_d
+from te_agent_migrate.strategy_d.standalone import desired_share_aids
+from te_agent_migrate.target_tokens import (
+    TOKEN_PATTERN,
+    TargetTokens,
+    clean_token,
+    normalize_token as _normalize_account_group_token,
+)
 from te_agent_migrate.strategy_d.preflight import (
     has_blockers as preflight_has_blockers,
     print_preflight,
@@ -33,7 +38,7 @@ from te_agent_migrate.ui_client import TevaUiClient
 from te_agent_migrate.workflow import MigrationRunner
 
 
-TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9]{32}$")
+DRY_RUN_SCHEMA = 4  # 4: binds the a2a repoint targets and the --repoint-agent-to-agent flag
 UI_USERNAME_ENV = "TE_AGENT_UI_USERNAME"
 UI_PASSWORD_ENV = "TE_AGENT_UI_PASSWORD"
 TARGET_ACCOUNT_TOKEN_ENV = "TE_TARGET_ACCOUNT_TOKEN"
@@ -57,15 +62,6 @@ def _environment_value(name):
     if not value:
         raise ConfigurationError("%s is set but empty" % name)
     return value
-
-
-def _normalize_account_group_token(value):
-    """Remove copy/paste whitespace and invisible format characters."""
-    return "".join(
-        character
-        for character in value
-        if not character.isspace() and unicodedata.category(character) != "Cf"
-    )
 
 
 def _positive_integer(value):
@@ -93,15 +89,27 @@ def build_parser():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Preview only (default).")
     mode.add_argument("--apply", action="store_true", help="Execute the migration.")
-    parser.add_argument("--inventory", default="inventory.csv", help="Inventory CSV path.")
+    parser.add_argument(
+        "--inventory",
+        default="work/input/inventory.csv",
+        help=(
+            "Inventory CSV path. Columns: type,name,ip_address[,agent_id][,target_aid][,share_aids] "
+            "(inventory v3; the last three are optional, in this order). "
+            "Strategy D: a row target_aid overrides the run target for that device."
+        ),
+    )
     parser.add_argument(
         "--strategy",
         help=(
             "A=agents only, B=share tests, C=recreate tests (apply is blocked; "
             "tests cannot stay in the source group), D=move the agent and keep the "
             "tests in the source group (share back and assign). "
-            "D moves only the devices listed in the inventory (type,name,ip_address"
-            "[,agent_id]) and runs one device at a time."
+            "D moves only the devices listed in the inventory and runs one device at a time. "
+            "D reads the v3 columns: target_aid is the target group of the row and overrides "
+            "the run target (TE_TARGET_AID); share_aids lists the groups that must see the "
+            "device after the move. When every row has a target_aid, the run target is not "
+            "needed. Each target group needs its own registration token "
+            "(TE_TARGET_TOKEN_<aid>, or a hidden prompt). A, B and C ignore these columns."
         ),
     )
     parser.add_argument(
@@ -122,6 +130,24 @@ def build_parser():
             "Strategy D only (default off): after a cluster is rebuilt, re-enable the tests that "
             "the unassign disabled. Without this flag the tool prints a manual list. "
             "Uses a full-payload PUT; lab check 7 must pass first."
+        ),
+    )
+    parser.add_argument(
+        "--repoint-agent-to-agent",
+        dest="repoint_agent_to_agent",
+        action="store_true",
+        help=(
+            "Strategy D only (default off; ignored with an info line for A, B and C): after a move the "
+            "device has a NEW agent id, and agent-to-agent tests name their target by id. Without this "
+            "flag preflight BLOCKS every device that such a test targets. With this flag preflight does "
+            "not block; it warns '<N> agent-to-agent test(s) will be repointed after the move' and "
+            "records each test (account group, test id, old target id). After the new agent is online, "
+            "shared and has its tests, and BEFORE the old agent is deleted, the tool changes only "
+            "targetAgentId of each recorded test to the new id (full-payload PUT, then a read-back). If "
+            "one test fails, the old agent is kept. A test whose targetAgentId cannot be read becomes a "
+            "BLOCKER (the repoint cannot be proven safe). A cluster that such a test targets is a BLOCKER "
+            "(not supported). The snapshot file lists the old target ids, so you can undo by hand. The "
+            "dry-run file binds the flag and the tests. Lab check: the PUT must change nothing else."
         ),
     )
     parser.add_argument(
@@ -158,7 +184,7 @@ def build_parser():
         dest="parallelism",
         help="Parallel connections (1-5). Strategy D always uses 1.",
     )
-    parser.add_argument("--output", default="reports", help="Artifact directory.")
+    parser.add_argument("--output", default="work/runs", help="Artifact directory.")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -214,22 +240,7 @@ def _resolve_target_account_token(target, report, prompter, console):
             "Target token loaded from %s and bound to %s [%s] via %s"
             % (TARGET_ACCOUNT_TOKEN_ENV, target.name, target.aid, TARGET_ACCOUNT_TOKEN_AID_ENV),
         )
-    original_length = len(target_token)
-    target_token = _normalize_account_group_token(target_token)
-    removed_count = original_length - len(target_token)
-    if removed_count:
-        console.info(
-            "input",
-            "Ignored %s whitespace or invisible copy/paste character(s) in the "
-            "target account-group token" % removed_count,
-        )
-    if not TOKEN_PATTERN.fullmatch(target_token):
-        raise ConfigurationError(
-            "Target account-group token must be exactly 32 alphanumeric characters "
-            "after removing whitespace and invisible copy/paste characters; received "
-            "%s character(s)" % len(target_token)
-        )
-    return target_token
+    return clean_token(target_token, console)
 
 
 def _resolve_source_test_policy(strategy, supplied_policy, report, prompter, console):
@@ -308,6 +319,12 @@ def _load_dry_run_confirmation(path_text, inventory_path):
             "Dry-run confirmation file %s is not from a Strategy D dry run. Nothing was changed."
             % path
         )
+    if data.get("schema_version") != DRY_RUN_SCHEMA:
+        raise PreconditionRefused(
+            "Dry-run confirmation %s has an old file format (schema %s, schema %s is needed): "
+            "run --dry-run again. Nothing was changed."
+            % (path, data.get("schema_version"), DRY_RUN_SCHEMA)
+        )
     if data.get("inventory_sha256") != _sha256_file(inventory_path):
         raise PreconditionRefused(
             "Dry-run confirmation is stale: the inventory file changed after the dry run. "
@@ -316,15 +333,31 @@ def _load_dry_run_confirmation(path_text, inventory_path):
     return data
 
 
-def _check_dry_run_groups(data, source, target):
-    for key, group in (("source_aid", source), ("target_aid", target)):
-        recorded = data.get(key)
-        if recorded is not None and str(recorded) != str(group.aid):
-            raise PreconditionRefused(
-                "Dry-run confirmation was made for %s %s, but this run uses %s %s. "
-                "Run --dry-run again. Nothing was changed."
-                % (key, recorded, key, group.aid)
-            )
+def _check_dry_run_groups(data, source, target_aids):
+    """The source group and the SET of target groups must be the ones of the dry run.
+
+    ``target_aids`` holds every target aid of this run (row targets and run target). The order
+    does not matter. The key ``target_aid`` of the file (run target) is for reading only.
+    """
+    recorded_source = data.get("source_aid")
+    if (None if recorded_source is None else str(recorded_source)) != str(source.aid):
+        raise PreconditionRefused(
+            "Dry-run confirmation was made for source_aid %s, but this run uses source_aid %s. "
+            "Run --dry-run again. Nothing was changed." % (recorded_source, source.aid)
+        )
+    recorded = data.get("target_aids")
+    if not isinstance(recorded, list):
+        raise PreconditionRefused(
+            "Dry-run confirmation has no list of target groups (old file format): "
+            "run --dry-run again. Nothing was changed."
+        )
+    before = sorted(str(aid) for aid in recorded)
+    now = sorted(set(str(aid) for aid in target_aids))
+    if before != now:
+        raise PreconditionRefused(
+            "Dry-run confirmation was made for target group(s) [%s], but this run uses [%s]. "
+            "Run --dry-run again. Nothing was changed." % (", ".join(before), ", ".join(now))
+        )
 
 
 def _strategy_gate(strategy, mode, console):
@@ -370,13 +403,13 @@ def _make_ip_ui_factory(get_credentials):
     return factory
 
 
-OPTIONAL_CONTEXT_PARAMS = ("snapshot_dir", "auto_reenable_tests")
+OPTIONAL_CONTEXT_PARAMS = ("snapshot_dir", "auto_reenable_tests", "repoint_a2a")
 
 
 def _build_flow_context(kwargs, snapshot_dir):
     """Build FlowContext. Drops optional parameters this build does not have yet.
 
-    ``snapshot_dir`` and ``auto_reenable_tests`` are optional. When FlowContext rejects one of them
+    ``snapshot_dir``, ``auto_reenable_tests`` and ``repoint_a2a`` are optional. When FlowContext rejects one of them
     (TypeError that names it), the call is repeated without it. A dropped ``auto_reenable_tests=True``
     is announced, because the operator asked for it.
     """
@@ -395,6 +428,12 @@ def _build_flow_context(kwargs, snapshot_dir):
                 kwargs["console"].info(
                     "configuration", "snapshot_dir is not supported by this build; no snapshot files"
                 )
+            elif name == "repoint_a2a" and value:
+                kwargs["console"].info(
+                    "configuration",
+                    "WARNING: repoint_a2a is not supported by this build; it is ignored and preflight "
+                    "blocks every device that agent-to-agent tests target",
+                )
             elif value:
                 kwargs["console"].info(
                     "configuration",
@@ -411,13 +450,22 @@ def _exit_code(console, results):
     return EXIT_OK if _results_clean(console, results) else EXIT_FAILED
 
 
-def _write_strategy_d_summary(report, results, mode, source, target, snapshot_dir, exit_code):
+def _write_strategy_d_summary(
+    report, results, mode, source, target, snapshot_dir, exit_code, target_aids=None, repoint_a2a=False
+):
+    # Target group of each device, from the preflight items (None when the result has no device).
+    target_of = {}
+    for pre_item in getattr(results, "preflight_items", None) or []:
+        aid = _item_target(pre_item, target.aid)
+        if aid:
+            target_of[pre_item.name] = aid
     items = []
     for result in results:
         snapshot_path = getattr(result, "snapshot", None) or getattr(result, "snapshot_path", None)
         items.append(
             {
                 "name": result.name,
+                "target": target_of.get(result.name),
                 "ok": bool(result.ok),
                 "detail": result.detail,
                 "new_agent_id": result.new_agent_id,
@@ -433,7 +481,9 @@ def _write_strategy_d_summary(report, results, mode, source, target, snapshot_di
         "strategy": TestStrategy.DIRECT_SHARE.value,
         "source_aid": source.aid,
         "target_aid": target.aid,
+        "target_aids": list(target_aids or [target.aid]),
         "snapshot_dir": str(snapshot_dir),
+        "repoint_a2a": bool(repoint_a2a),
         "exit_code": exit_code,
         "results": items,
         "recap": list(getattr(results, "rows", [])),
@@ -475,42 +525,88 @@ def _item_key(item):
     return _item_agent_id(item) or "name:%s" % item.name
 
 
-def _dry_run_binding(items, owner_is_source):
-    """What a dry run saw: ready devices (id, kind, shares, owner flag) and excluded ids."""
+def _item_target(item, default_target_aid):
+    """Target group of a device: set by preflight, else the inventory row, else the run-level target."""
+    return str(
+        getattr(item, "target_aid", "")
+        or getattr(item.inventory, "target_aid", None)
+        or default_target_aid
+        or ""
+    )
+
+
+def _a2a_pairs(item):
+    """Sorted [aid, test_id] pairs (str) of the agent-to-agent tests that the flow would repoint."""
+    return sorted([entry["aid"], entry["test_id"]] for entry in a2a_targets_of(item))
+
+
+def _pairs_text(pairs):
+    return ", ".join("%s/%s" % (pair[0], pair[1]) for pair in pairs)
+
+
+def _dry_run_binding(items, owner_is_source, default_target_aid=None, repoint_a2a=False):
+    """What a dry run saw.
+
+    Ready devices: id, kind, target group, the groups that see the device now (share_aids), the final
+    share list the flow sends (final_share_aids, resolved: inventory + live + test groups + target),
+    owner flag, and ``a2a_targets``: the sorted (aid, test_id) pairs of the agent-to-agent tests the flow
+    would repoint (empty without ``--repoint-agent-to-agent``). Top level ``repoint_a2a`` is the flag.
+    Also the excluded (offline) keys and the skipped (already migrated) keys.
+    """
     ready = []
     excluded = []
+    skipped = []
     for item in items:
         if item.status == "ready":
+            target = _item_target(item, default_target_aid)
             ready.append(
                 {
                     "name": item.name,
                     "kind": "cluster" if item.inventory.is_cluster else "agent",
                     "agent_id": _item_agent_id(item),
                     "key": _item_key(item),
+                    "target_aid": target,
                     "share_aids": sorted(str(aid) for aid in item.share_aids),
+                    "final_share_aids": sorted(desired_share_aids(item, target)),
                     "owner": "assumed" if getattr(item, "owner_assumed", False) else "proven",
+                    "a2a_targets": _a2a_pairs(item),
                 }
             )
         elif item.status == "excluded":
             excluded.append(_item_key(item))
+        elif item.status == "skipped":
+            skipped.append(_item_key(item))
     ready.sort(key=lambda entry: entry["key"])
     return {
         "owner_is_source": bool(owner_is_source),
+        "repoint_a2a": bool(repoint_a2a),
         "ready": ready,
         "excluded_ids": sorted(set(excluded)),
+        "skipped_ids": sorted(set(skipped)),
     }
 
 
-def _compare_dry_run_binding(data, items, owner_is_source):
+def _compare_dry_run_binding(data, items, owner_is_source, default_target_aid=None, repoint_a2a=False):
     """Refuse (PreconditionRefused) when the fresh preflight differs from the dry run."""
+    schema = data.get("schema_version")
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema < DRY_RUN_SCHEMA:
+        raise PreconditionRefused(
+            "Dry-run confirmation has an old file format (schema %s, schema %s is needed): "
+            "run --dry-run again. Nothing was changed." % (schema, DRY_RUN_SCHEMA)
+        )
     expected = data.get("ready")
     if not isinstance(expected, list) or "excluded_ids" not in data or "owner_is_source" not in data:
         raise PreconditionRefused(
             "Dry-run confirmation has no device binding (old file format). "
             "Run --dry-run again. Nothing was changed."
         )
-    now = _dry_run_binding(items, owner_is_source)
+    now = _dry_run_binding(items, owner_is_source, default_target_aid, repoint_a2a)
     problems = []
+    if bool(data.get("repoint_a2a")) != now["repoint_a2a"]:
+        problems.append(
+            "--repoint-agent-to-agent was %s in the dry run and is %s now"
+            % ("set" if data.get("repoint_a2a") else "not set", "set" if now["repoint_a2a"] else "not set")
+        )
     if bool(data.get("owner_is_source")) != now["owner_is_source"]:
         problems.append(
             "--owner-is-source was %s in the dry run and is %s now"
@@ -535,6 +631,26 @@ def _compare_dry_run_binding(data, items, owner_is_source):
                 % (new["name"], ", ".join(sorted(str(a) for a in old.get("share_aids") or [])),
                    ", ".join(new["share_aids"]))
             )
+        if str(old.get("target_aid")) != new["target_aid"]:
+            problems.append(
+                "%s: target group changed from %s to %s" % (new["name"], old.get("target_aid"), new["target_aid"])
+            )
+        if sorted(str(a) for a in old.get("final_share_aids") or []) != new["final_share_aids"]:
+            problems.append(
+                "%s: final share list changed from [%s] to [%s]"
+                % (new["name"], ", ".join(sorted(str(a) for a in old.get("final_share_aids") or [])),
+                   ", ".join(new["final_share_aids"]))
+            )
+        old_pairs = sorted(
+            [str(pair[0]), str(pair[1])]
+            for pair in old.get("a2a_targets") or []
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        )
+        if old_pairs != new["a2a_targets"]:
+            problems.append(
+                "%s: agent-to-agent tests to repoint changed from [%s] to [%s] (aid/test)"
+                % (new["name"], _pairs_text(old_pairs), _pairs_text(new["a2a_targets"]))
+            )
         if old.get("kind") != new["kind"]:
             problems.append("%s: kind changed from %s to %s" % (new["name"], old.get("kind"), new["kind"]))
         if old.get("owner") != new["owner"]:
@@ -544,6 +660,8 @@ def _compare_dry_run_binding(data, items, owner_is_source):
             )
     if sorted(str(i) for i in data.get("excluded_ids") or []) != now["excluded_ids"]:
         problems.append("the set of excluded (offline) devices changed")
+    if sorted(str(i) for i in data.get("skipped_ids") or []) != now["skipped_ids"]:
+        problems.append("the set of skipped (already migrated) devices changed")
     if problems:
         shown = "; ".join(problems[:8])
         if len(problems) > 8:
@@ -567,9 +685,14 @@ def _consume_dry_run_file(path_text):
 
 
 def _update_dry_run_confirmation(
-    output, clean, inventory_path, source, target, agents, items=None, owner_is_source=False
+    output, clean, inventory_path, source, default_target_aid, agents, items=None, owner_is_source=False,
+    target_aids=None, repoint_a2a=False,
 ):
-    """Write dry-run-ok.json after a clean dry run. Remove an older one when not clean."""
+    """Write dry-run-ok.json after a clean dry run. Remove an older one when not clean.
+
+    ``target_aids`` is every target group of the run. The file stores it sorted. ``target_aid`` is the
+    run target (None when every row names its own target); it is there for reading only.
+    """
     path = Path(output) / DRY_RUN_OK_FILENAME
     if not clean or items is None:
         try:
@@ -579,18 +702,45 @@ def _update_dry_run_confirmation(
             pass
         return None
     payload = {
-        "schema_version": 2,
+        "schema_version": DRY_RUN_SCHEMA,
         "strategy": TestStrategy.DIRECT_SHARE.value,
         "inventory_file": str(inventory_path),
         "inventory_sha256": _sha256_file(inventory_path),
         "source_aid": source.aid,
-        "target_aid": target.aid,
+        "target_aid": default_target_aid,
+        "target_aids": sorted(set(str(aid) for aid in (target_aids or []))),
         "entries": len(agents),
         "created_utc": _utc_now_text(),
     }
-    payload.update(_dry_run_binding(items, owner_is_source))
+    payload.update(_dry_run_binding(items, owner_is_source, default_target_aid, repoint_a2a))
     _write_private_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path
+
+
+def _needs_run_target(agents):
+    """True when at least one inventory row has no target_aid (it uses the target of the run)."""
+    return any(not agent.target_aid for agent in agents)
+
+
+def _all_target_aids(agents, run_target):
+    """Distinct target aids of the inventory, in order of first use."""
+    aids = []
+    for agent in agents:
+        aid = agent.target_aid or run_target.aid
+        if aid not in aids:
+            aids.append(aid)
+    return aids
+
+
+def _check_inventory_targets(agents, groups):
+    """Every target_aid of the inventory must be a group the OAuth token can see."""
+    known = set(group.aid for group in groups)
+    missing = sorted(set(a.target_aid for a in agents if a.target_aid and a.target_aid not in known))
+    if missing:
+        raise ConfigurationError(
+            "The inventory names target group id(s) that the OAuth token cannot access: %s. "
+            "No agents were reset." % ", ".join(missing)
+        )
 
 
 def _run_strategy_d(
@@ -599,12 +749,15 @@ def _run_strategy_d(
 ):
     apply_mode = selected_mode is Mode.APPLY
     snapshot_dir = Path(output) / "snapshots"
+    target_names = dict((group.aid, group.name) for group in groups)
+    target_labels = dict((aid, "%s [%s]" % (name, aid)) for aid, name in target_names.items())
+    default_target_aid = target.aid if _needs_run_target(agents) else None
     if apply_mode:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        target_token = _resolve_target_account_token(target, report, prompter, console)
     else:
-        target_token = ""
-        console.info("input", "Dry run: the target account-group token is not requested or used")
+        console.info("input", "Dry run: the target account-group tokens are not requested or used")
+    target_token = ""
+    tokens = {}
     for line in describe_inventory(agents).splitlines():
         console.info("inventory", line.strip())
     kwargs = dict(
@@ -620,6 +773,13 @@ def _run_strategy_d(
         kwargs["timeout_seconds"] = args.timeout
     auto_reenable = bool(getattr(args, "auto_reenable_tests", False))
     kwargs["auto_reenable_tests"] = auto_reenable
+    repoint_a2a = bool(getattr(args, "repoint_agent_to_agent", False))
+    if repoint_a2a:  # passed only when set: an older FlowContext without the parameter still works
+        kwargs["repoint_a2a"] = True
+    report.record_decision(
+        "Strategy D repoint agent-to-agent tests",
+        "enabled" if repoint_a2a else "disabled (devices that a2a tests target are blocked)",
+    )
     report.record_decision(
         "Strategy D auto re-enable tests", "enabled" if auto_reenable else "disabled (manual list)"
     )
@@ -630,6 +790,7 @@ def _run_strategy_d(
         # The context is a dry-run context: its API wrapper refuses every write call.
         pre_kwargs = dict(kwargs, apply=False, target_account_token="")
         pre_ctx = _build_flow_context(pre_kwargs, str(snapshot_dir))
+        pre_ctx.target_names = dict(target_names)
         console.play("Strategy D: preflight before confirmation", Mode.DRY_RUN, "D")
         pre_items = run_preflight(
             ctx=pre_ctx,
@@ -641,7 +802,8 @@ def _run_strategy_d(
         summary = preflight_summary(pre_items)
         console.info(
             "preflight",
-            "ready=%(ready)s blocked=%(blocked)s excluded=%(excluded)s" % summary,
+            "ready=%s blocked=%s excluded=%s skipped=%s"
+            % (summary["ready"], summary["blocked"], summary["excluded"], summary.get("skipped", 0)),
         )
         # The dry run is bound to the ready devices and their shares. Any difference refuses (exit 2).
         if dry_run_data is None:
@@ -649,13 +811,22 @@ def _run_strategy_d(
                 "Strategy D --apply has no dry-run confirmation data. Run --dry-run first. "
                 "Nothing was changed."
             )
-        _compare_dry_run_binding(dry_run_data, pre_items, owner_is_source)
+        _compare_dry_run_binding(dry_run_data, pre_items, owner_is_source, default_target_aid, repoint_a2a)
         report.record_decision("Strategy D apply", "dry-run binding matches the fresh preflight")
         if preflight_has_blockers(pre_items):
             report.record_decision("Strategy D apply", "preflight blocked")
             console.info("run", "preflight has blockers; nothing was changed")
             report.write_final()
             return EXIT_FAILED
+        # Ask for every needed token now, before the first reset: a missing token must not stop the run later.
+        needed = []
+        for item in pre_items:
+            aid = item_target_aid(pre_ctx, item)
+            if item.status == "ready" and aid not in needed:
+                needed.append(aid)
+        tokens = TargetTokens(report, prompter, console, labels=target_labels).collect(needed)
+        target_token = tokens.get(target.aid, "")
+        kwargs["target_account_token"] = target_token
         if not prompter.confirm_destructive():
             report.record_decision("Strategy D apply", "operator declined")
             console.info("run", "operator declined; nothing was changed")
@@ -666,9 +837,13 @@ def _run_strategy_d(
         _consume_dry_run_file(args.confirmed_dry_run_file)
         console.info("gate", "dry-run confirmation marked as used (%s.used)" % args.confirmed_dry_run_file)
     ctx = _build_flow_context(kwargs, str(snapshot_dir))
+    ctx.target_tokens = dict(tokens)
+    ctx.target_names = dict(target_names)
+    all_target_aids = _all_target_aids(agents, target)
     console.info(
         "run",
-        "Strategy D: one device at a time; %s device(s) selected" % len(agents),
+        "Strategy D: one device at a time; %s device(s) selected; %s target group(s)"
+        % (len(agents), len(all_target_aids)),
     )
     try:
         results = run_strategy_d(
@@ -685,7 +860,8 @@ def _run_strategy_d(
             code = EXIT_INTERRUPTED if isinstance(exc, KeyboardInterrupt) else EXIT_FAILED
             try:
                 summary_path = _write_strategy_d_summary(
-                    report, partial, selected_mode, source, target, snapshot_dir, code
+                    report, partial, selected_mode, source, target, snapshot_dir, code, all_target_aids,
+                    repoint_a2a,
                 )
                 report.write_final()
                 console.info("run", "Strategy D summary (interrupted run): %s" % summary_path)
@@ -701,11 +877,12 @@ def _run_strategy_d(
     if not apply_mode:
         confirmation = _update_dry_run_confirmation(
             output, clean and not getattr(results, "blocked", False),
-            inventory_path, source, target, agents,
+            inventory_path, source, default_target_aid, agents,
             items=getattr(results, "preflight_items", None), owner_is_source=owner_is_source,
+            target_aids=all_target_aids, repoint_a2a=repoint_a2a,
         )
     summary_path = _write_strategy_d_summary(
-        report, results, selected_mode, source, target, snapshot_dir, code
+        report, results, selected_mode, source, target, snapshot_dir, code, all_target_aids, repoint_a2a
     )
     report.write_final()
     console.info("run", "Strategy D summary: %s" % summary_path)
@@ -764,6 +941,8 @@ def _main(argv=None):
         _strategy_gate(selected_strategy, selected_mode, console)
         if getattr(args, "auto_reenable_tests", False) and not is_strategy_d:
             console.info("configuration", "--auto-reenable-tests applies only to Strategy D; ignored")
+        if getattr(args, "repoint_agent_to_agent", False) and not is_strategy_d:
+            console.info("configuration", "--repoint-agent-to-agent applies only to Strategy D; ignored")
         dry_run_data = None
         if is_strategy_d and apply_mode:
             dry_run_data = _load_dry_run_confirmation(args.confirmed_dry_run_file, inventory)
@@ -825,21 +1004,59 @@ def _main(argv=None):
                 "api_account_groups",
                 "OAuth token can access %s account group(s)" % len(groups),
             )
-            source = _group_from_env(groups, "TE_SOURCE_AID", "source", prompter)
-            target = _group_from_env(groups, "TE_TARGET_AID", "target", prompter)
-            if source.aid == target.aid:
-                raise ConfigurationError("Source and target account groups must be different")
-            if dry_run_data is not None:
-                _check_dry_run_groups(dry_run_data, source, target)
-            console.info(
-                "configuration",
-                "source=%s [%s]; target=%s [%s]"
-                % (source.name, source.aid, target.name, target.aid),
-            )
+            # Strategy D: an unknown row target stops the run before any prompt or flow.
             if is_strategy_d:
-                console.destination_banner(
-                    source, target, selected_mode, destructive=apply_mode
+                _check_inventory_targets(agents, groups)
+            source = _group_from_env(groups, "TE_SOURCE_AID", "source", prompter)
+            own_targets = any(agent.target_aid for agent in agents)
+            if own_targets and not is_strategy_d:
+                console.info(
+                    "configuration", "target_aid and share_aids columns apply only to Strategy D; ignored"
                 )
+            # Strategy D: when every row names its target, the run needs no target of its own.
+            needs_target = (not is_strategy_d) or _needs_run_target(agents)
+            if needs_target:
+                target = _group_from_env(groups, "TE_TARGET_AID", "target", prompter)
+            else:
+                # Every row has its own target. The run target is the first one (for the context only).
+                target = next(group for group in groups if group.aid == agents[0].target_aid)
+            all_target_aids = _all_target_aids(agents, target) if is_strategy_d else [target.aid]
+            if source.aid in all_target_aids:
+                raise ConfigurationError(
+                    "Source and target account groups must be different (source %s is also a target)"
+                    % source.aid
+                )
+            if dry_run_data is not None:
+                _check_dry_run_groups(dry_run_data, source, all_target_aids)
+            if needs_target:
+                console.info(
+                    "configuration",
+                    "source=%s [%s]; target=%s [%s]"
+                    % (source.name, source.aid, target.name, target.aid),
+                )
+            else:
+                console.info(
+                    "configuration",
+                    "source=%s [%s]; every inventory row names its own target group"
+                    % (source.name, source.aid),
+                )
+            if is_strategy_d:
+                if own_targets:
+                    counts = {}
+                    for agent in agents:
+                        aid = agent.target_aid or target.aid
+                        counts[aid] = counts.get(aid, 0) + 1
+                    names = dict((group.aid, group.name) for group in groups)
+                    console.targets_banner(
+                        source,
+                        [("%s [%s]" % (names.get(aid, aid), aid), counts[aid]) for aid in all_target_aids],
+                        selected_mode,
+                        destructive=apply_mode,
+                    )
+                else:
+                    console.destination_banner(
+                        source, target, selected_mode, destructive=apply_mode
+                    )
                 code = _run_strategy_d(
                     args, api, groups, source, target, selected_mode, agents, console,
                     report, prompter, output, inventory, get_ui_credentials,

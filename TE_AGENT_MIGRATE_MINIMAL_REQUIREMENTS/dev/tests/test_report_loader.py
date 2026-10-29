@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 try:
-    from tests.test_report_fixtures import SECRET_MARKER, build_discovery, write_json, write_selection
+    from dev.tests.test_report_fixtures import SECRET_MARKER, build_discovery, write_json, write_selection
 except ImportError:  # discovery started inside tests/
     from test_report_fixtures import SECRET_MARKER, build_discovery, write_json, write_selection
 
