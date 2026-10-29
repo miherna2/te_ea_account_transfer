@@ -10,6 +10,55 @@ from te_agent_migrate.errors import ApiError, VisibilityTimeout
 from te_agent_migrate.http import RetryPolicy, TRANSIENT_STATUS_CODES
 from te_agent_migrate.models import AccountGroup, AgentRecord, TestRecord
 
+WRITE_METHODS = ("POST", "PUT", "DELETE", "PATCH")
+WRITE_429_RETRIES = 4
+MAX_RETRY_AFTER_SECONDS = 60.0
+CLUSTER_AGENT_TYPE = "enterprise-cluster"
+TAG_ASSIGNMENT_TYPES = (
+    "test",
+    "v-agent",
+    "endpoint-test",
+    "dashboard",
+    "connected-devices-test",
+)
+
+
+class AmbiguousAgentMatch(ApiError):
+    """More than one new agent qualifies as the registered device. The caller must stop."""
+
+    def __init__(self, message, agent_ids=None):
+        ApiError.__init__(self, message)
+        self.agent_ids = list(agent_ids or [])
+
+
+def retry_after_seconds(value, fallback):
+    """Seconds to wait from a Retry-After header: decimals allowed, capped at 60. Bad value -> fallback."""
+    try:
+        seconds = float(str(value).strip())
+    except (TypeError, ValueError):
+        return fallback
+    if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+        return fallback
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
+def _write_body(response):
+    """Body of a successful write. The server already applied it, so any 2xx body is accepted.
+
+    Object -> the object. Array -> ``{'_list': [...]}``. Empty, non-JSON or scalar -> ``{}``.
+    """
+    if response.status_code == 204 or not response.content:
+        return {}
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        return {"_list": payload}
+    return {}
+
 
 class ThousandEyesApiClient(object):
     def __init__(
@@ -55,7 +104,15 @@ class ThousandEyesApiClient(object):
     ):
         expected = expected or set((200,))
         retryable = method.upper() in ("GET", "HEAD") if safe_to_retry is None else safe_to_retry
-        attempts = self._retry.attempts if retryable else 1
+        # Writes are never retried, except on HTTP 429: the server rejected the
+        # request without executing it, so repeating it cannot duplicate effects.
+        reject_only_retry = (not retryable) and method.upper() in WRITE_METHODS
+        if retryable:
+            attempts = self._retry.attempts
+        elif reject_only_retry:
+            attempts = 1 + WRITE_429_RETRIES
+        else:
+            attempts = 1
         query = dict(params or {})
         if aid is not None:
             query["aid"] = aid
@@ -73,11 +130,13 @@ class ThousandEyesApiClient(object):
                         allow_redirects=False,
                     )
             except requests.RequestException as exc:
-                if attempt == attempts:
+                if attempt == attempts or not retryable:
                     raise ApiError("API %s %s failed: %s" % (method, path, exc))
                 self._sleep(self._retry.delay(attempt))
                 continue
             if response.status_code in expected:
+                if method.upper() in WRITE_METHODS:
+                    return _write_body(response)
                 if response.status_code == 204 or not response.content:
                     return {}
                 try:
@@ -87,9 +146,14 @@ class ThousandEyesApiClient(object):
                 if not isinstance(payload, dict):
                     raise ApiError("API %s %s returned an unexpected JSON shape" % (method, path))
                 return payload
-            if response.status_code in TRANSIENT_STATUS_CODES and attempt < attempts:
+            retry_status = (
+                response.status_code == 429
+                if reject_only_retry
+                else response.status_code in TRANSIENT_STATUS_CODES
+            )
+            if retry_status and attempt < attempts:
                 retry_after = response.headers.get("retry-after")
-                delay = float(retry_after) if retry_after and retry_after.isdigit() else self._retry.delay(attempt)
+                delay = retry_after_seconds(retry_after, self._retry.delay(attempt))
                 self._sleep(delay)
                 continue
             break
@@ -140,6 +204,94 @@ class ThousandEyesApiClient(object):
             for item in self._paginate("agents", "agents", aid=aid, params=params)
         ]
 
+    def list_agents_with_clusters(self, aid):
+        params = {
+            "agentTypes": "enterprise,enterprise-cluster",
+            "expand": "cluster-member,test-ids",
+        }
+        return [
+            AgentRecord.from_api(item, aid)
+            for item in self._paginate("agents", "agents", aid=aid, params=params)
+        ]
+
+    def get_agent(self, aid, agent_id):
+        payload = self.request(
+            "GET",
+            "agents/%s" % agent_id,
+            aid=aid,
+            params={"expand": "cluster-member"},
+        )
+        raw = payload
+        if "agentId" not in payload and "id" not in payload:
+            nested = payload.get("agent")
+            if nested is None and isinstance(payload.get("agents"), list) and payload["agents"]:
+                nested = payload["agents"][0]
+            if isinstance(nested, dict):
+                raw = nested
+        if not isinstance(raw, dict):
+            raise ApiError("Agent %s returned an unexpected JSON shape" % agent_id)
+        return AgentRecord.from_api(raw, aid)
+
+    def set_agent_account_groups(self, aid, agent_id, account_group_ids):
+        cleaned = []
+        for value in account_group_ids or []:
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip():
+                raise ApiError("Account group ids must be non-empty strings or integers")
+            text = str(value).strip()
+            if text not in cleaned:
+                cleaned.append(text)
+        if not cleaned:
+            raise ApiError(
+                "Refusing to set an empty account group list: it would remove every share"
+            )
+        return self.request(
+            "PUT",
+            "agents/%s" % agent_id,
+            aid=aid,
+            json_body={"accountGroups": cleaned},
+            expected=set((200,)),
+            safe_to_retry=False,
+        )
+
+    def cluster_assign(self, aid, base_agent_id, agent_ids):
+        base = str(base_agent_id)
+        members = [str(value) for value in (agent_ids or [])]
+        if base in members:
+            raise ApiError("The base agent %s must not be in its own cluster assign list" % base)
+        deduped = []
+        for value in members:
+            if not value.strip():
+                raise ApiError("Cluster member agent ids must be non-empty")
+            if value not in deduped:
+                deduped.append(value)
+        return self.request(
+            "POST",
+            "agents/%s/cluster/assign" % base,
+            aid=aid,
+            json_body={"agents": deduped},
+            expected=set((200, 201, 204)),
+            safe_to_retry=False,
+        )
+
+    def cluster_unassign(self, aid, cluster_id, member_ids):
+        members = []
+        for value in member_ids or []:
+            text = str(value).strip()
+            if not text:
+                raise ApiError("Cluster member ids must be non-empty")
+            if text not in members:
+                members.append(text)
+        if not members:
+            raise ApiError("Refusing cluster unassign with no member ids")
+        return self.request(
+            "POST",
+            "agents/%s/cluster/unassign" % cluster_id,
+            aid=aid,
+            json_body={"members": members},
+            expected=set((200, 201, 204)),
+            safe_to_retry=False,
+        )
+
     @staticmethod
     def match_agent(agents, hostname, ip_address, online_only=False):
         candidates = [
@@ -158,6 +310,32 @@ class ThousandEyesApiClient(object):
 
         return max(candidates, key=identity_order) if candidates else None
 
+    @staticmethod
+    def match_new_agents(agents, names, ips, known_ids, online_only=True):
+        """Strict match for a device that registered again after a reset. Returns every qualifying record.
+
+        A record qualifies when ALL of these hold: its id is not in ``known_ids``; it is online (when
+        ``online_only``); one of its IPs is in ``ips``; and its hostname or its name equals one of ``names``,
+        or its name starts with ``<name>-`` (case-insensitive). The agent may register under a name such
+        as ``name-xxxx``. A name that only shares a prefix (``name2``, ``namebox``) does not qualify.
+        """
+        folded = [str(n).casefold() for n in names if n]
+        wanted_ips = set(str(i) for i in ips if i)
+        known = set(str(i) for i in known_ids)
+        result = []
+        for agent in agents:
+            if agent.agent_id in known:
+                continue
+            if online_only and not agent.online:
+                continue
+            if not wanted_ips.intersection(agent.ip_addresses):
+                continue
+            name = (agent.name or "").casefold()
+            host = (agent.hostname or "").casefold()
+            if any(host == n or name == n or name.startswith(n + "-") for n in folded):
+                result.append(agent)
+        return result
+
     def wait_for_agent(
         self,
         aid,
@@ -167,7 +345,18 @@ class ThousandEyesApiClient(object):
         poll_interval_seconds=5.0,
         on_poll=None,
         on_not_visible=None,
+        known_ids=None,
+        alt_names=None,
+        alt_ips=None,
     ):
+        """Wait for an online agent in ``aid``.
+
+        Default (``known_ids`` is None): old behavior, IP or name or hostname, highest id wins.
+        Strict mode (``known_ids`` is a collection of agent ids, may be empty): only a record that is not
+        in ``known_ids`` and whose IP and name both match qualifies (see ``match_new_agents``);
+        ``alt_names`` and ``alt_ips`` add more accepted names and IPs. Two or more qualifying records
+        raise ``AmbiguousAgentMatch``.
+        """
         deadline = self._monotonic() + timeout_seconds
         poll_number = 0
         while True:
@@ -175,12 +364,28 @@ class ThousandEyesApiClient(object):
             remaining = max(0.0, deadline - self._monotonic())
             if on_poll is not None:
                 on_poll(poll_number, remaining)
-            agent = self.match_agent(
-                self.list_agents(aid),
-                hostname=hostname,
-                ip_address=ip_address,
-                online_only=True,
-            )
+            if known_ids is None:
+                agent = self.match_agent(
+                    self.list_agents(aid),
+                    hostname=hostname,
+                    ip_address=ip_address,
+                    online_only=True,
+                )
+            else:
+                found = self.match_new_agents(
+                    self.list_agents(aid),
+                    [hostname] + list(alt_names or []),
+                    [ip_address] + list(alt_ips or []),
+                    known_ids,
+                )
+                if len(found) > 1:
+                    ids = sorted(item.agent_id for item in found)
+                    raise AmbiguousAgentMatch(
+                        "More than one new online agent matches %s in account group %s (ids %s)"
+                        % (hostname, aid, ", ".join(ids)),
+                        ids,
+                    )
+                agent = found[0] if found else None
             if agent is not None:
                 return agent
             if on_not_visible is not None:
@@ -255,8 +460,40 @@ class ThousandEyesApiClient(object):
             for item in self._paginate("tests", "tests", aid=aid)
         ]
 
-    def list_tags(self, aid):
-        return list(self._paginate("tags", "tags", aid=aid))
+    def list_tags(self, aid, expand_assignments=False):
+        params = {"expand": "assignments"} if expand_assignments else None
+        return list(self._paginate("tags", "tags", aid=aid, params=params))
+
+    def assign_tag(self, aid, tag_id, assignments):
+        """Assign a tag to objects. ``assignments``: (id, type) tuples or dicts."""
+        normalized = []
+        for item in assignments or []:
+            if isinstance(item, dict):
+                object_id, object_type = item.get("id"), item.get("type")
+            elif isinstance(item, (tuple, list)) and len(item) == 2:
+                object_id, object_type = item
+            else:
+                raise ApiError("Tag assignments must be (id, type) tuples or dicts")
+            if isinstance(object_id, bool) or not isinstance(object_id, (str, int)) or not str(object_id).strip():
+                raise ApiError("Tag assignment id must be a non-empty string or integer")
+            if object_type not in TAG_ASSIGNMENT_TYPES:
+                raise ApiError(
+                    "Unsupported tag assignment type %r; allowed: %s"
+                    % (object_type, ", ".join(TAG_ASSIGNMENT_TYPES))
+                )
+            normalized.append({"id": str(object_id).strip(), "type": object_type})
+        if not normalized:
+            raise ApiError("Refusing to assign a tag with no assignments")
+        if not str(tag_id).strip():
+            raise ApiError("Tag id must not be empty")
+        return self.request(
+            "POST",
+            "tags/%s/assign" % tag_id,
+            aid=aid,
+            json_body={"assignments": normalized},
+            expected=set((200, 201, 204)),
+            safe_to_retry=False,
+        )
 
     def list_monitors(self, aid):
         return list(self._paginate("monitors", "monitors", aid=aid))
@@ -265,6 +502,8 @@ class ThousandEyesApiClient(object):
         response = self.request(
             "POST", "tags", aid=aid, json_body=payload, expected=set((200, 201)), safe_to_retry=False
         )
+        if "_list" in response:
+            raise ApiError("Created tag response had an unexpected shape")
         values = self._items(response, "tags") if isinstance(response.get("tags"), list) else []
         raw = values[0] if values else response.get("tag", response)
         if not isinstance(raw, dict):
@@ -283,6 +522,8 @@ class ThousandEyesApiClient(object):
             expected=set((200, 201)),
             safe_to_retry=False,
         )
+        if "_list" in response:
+            raise ApiError("Created alert-rule response had an unexpected shape")
         values = self._items(response, "alertRules") if isinstance(response.get("alertRules"), list) else []
         raw = values[0] if values else response.get("alertRule", response)
         if not isinstance(raw, dict):
@@ -315,7 +556,7 @@ class ThousandEyesApiClient(object):
             fields = ", ".join(sorted(payload))
             raise ApiError("%s; submitted field names=[%s] (values redacted)" % (exc, fields))
         raw = response.get("test", response)
-        if not isinstance(raw, dict):
+        if "_list" in response or not isinstance(raw, dict):
             raise ApiError("Created test response had an unexpected shape")
         return TestRecord.from_api(raw, aid)
 
@@ -454,7 +695,11 @@ class ThousandEyesApiClient(object):
                 )
             self._sleep(min(poll_interval_seconds, remaining))
 
-    def delete_agent(self, aid, agent_id):
+    def delete_agent(self, aid, agent_id, agent_type=None):
+        if str(agent_type or "").casefold() == CLUSTER_AGENT_TYPE:
+            raise ApiError(
+                "Refusing to delete a cluster: deleting a cluster deletes its member agents"
+            )
         self.request(
             "DELETE",
             "agents/%s" % agent_id,
@@ -482,4 +727,66 @@ class ThousandEyesApiClient(object):
             aid=aid,
             json_body={"testIds": [str(value) for value in test_ids]},
             expected=set((200, 201, 204)),
+        )
+
+    def set_test_enabled(self, aid, test_type, test_id, enabled):
+        """Set only the ``enabled`` flag of one test (read, change one field, PUT the full payload).
+
+        Response-only fields are dropped. Expanded objects (agents, tags, alert
+        rules, monitors, shared accounts) are reduced to the id forms a PUT accepts.
+        Lab check: a PUT with this payload must not change anything else on the test.
+        """
+        from copy import deepcopy
+        from te_agent_migrate.strategies import RESPONSE_ONLY_FIELDS  # late import: strategies imports this module
+
+        test = self.get_test(aid, test_type, test_id)
+        payload = deepcopy(test.raw)
+        for field in RESPONSE_ONLY_FIELDS:
+            payload.pop(field, None)
+        for field in ("labels", "alerts"):
+            payload.pop(field, None)
+
+        def ids_of(values, *keys):
+            result = []
+            for value in values if isinstance(values, list) else []:
+                found = next((value[k] for k in keys if isinstance(value, dict) and value.get(k) is not None), None)
+                found = value if not isinstance(value, dict) else found
+                if found is not None and str(found) and str(found) not in result:
+                    result.append(str(found))
+            return result
+
+        payload.pop("agents", None)
+        agent_ids = sorted(self._test_agent_ids(test))
+        if agent_ids:
+            payload["agents"] = [{"agentId": value} for value in agent_ids]
+        if "alertRules" in payload:
+            payload["alertRules"] = ids_of(payload["alertRules"], "ruleId", "id")
+        if "tags" in payload:
+            payload["tags"] = ids_of(payload["tags"], "tagId", "id")
+        if "monitors" in payload:
+            payload["monitors"] = ids_of(payload["monitors"], "monitorId", "id")
+        if "sharedWithAccounts" in payload:
+            shares = []
+            for item in payload["sharedWithAccounts"] or []:
+                value = item.get("aid", item.get("accountGroupId")) if isinstance(item, dict) else item
+                if value is not None and str(value):
+                    shares.append({"aid": int(value) if str(value).isdigit() else str(value)})
+            payload["sharedWithAccounts"] = shares
+        payload["enabled"] = bool(enabled)
+        return self.update_test(aid, test_type, test_id, payload)
+
+    def set_test_enabled_minimal(self, aid, test_type, test_id, enabled):
+        """EXPERIMENTAL (lab check 7): PUT only ``{"enabled": <bool>}``, no other field.
+
+        Unlike ``set_test_enabled`` this sends no copy of the test, so it cannot overwrite masked
+        passwords, auth headers or ``transactionScript``. The lab must prove that the API accepts a
+        partial body and leaves every other field unchanged. Until then, use it only on a lab test.
+        """
+        return self.request(
+            "PUT",
+            "tests/%s/%s" % (test_type, test_id),
+            aid=aid,
+            json_body={"enabled": bool(enabled)},
+            expected=set((200, 204)),
+            safe_to_retry=False,
         )

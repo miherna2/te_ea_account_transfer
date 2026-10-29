@@ -98,7 +98,10 @@ class TevaUiClient(object):
         sleep=time.sleep,
     ):
         self.host = host
-        self.base_url = "https://%s" % host
+        text = str(host)
+        if ":" in text and not text.startswith("["):  # IPv6 literal: the URL needs brackets
+            text = "[%s]" % text
+        self.base_url = "https://%s" % text
         self._username = username
         self._password = password
         self._timeout_seconds = timeout_seconds

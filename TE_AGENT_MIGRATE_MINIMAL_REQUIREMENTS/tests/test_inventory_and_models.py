@@ -15,6 +15,8 @@ class InventoryAndModelsTests(unittest.TestCase):
             values = load_inventory(path)
         self.assertEqual(values[0].hostname, "TE1")
         self.assertEqual(values[0].ip_address, "192.0.2.10")
+        self.assertEqual(values[0].kind, "agent")
+        self.assertIsNone(values[0].agent_id)
 
     def test_inventory_rejects_credential_columns(self):
         with tempfile.TemporaryDirectory() as directory:

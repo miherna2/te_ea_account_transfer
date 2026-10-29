@@ -94,6 +94,18 @@ class UiClientTests(unittest.TestCase):
         self.assertEqual(session.calls[0][1], "https://192.0.2.10/api/app-config")
         self.assertEqual(session.calls[1][2]["headers"]["X-CSRFToken"], "csrf-new")
 
+    def test_ipv6_literal_host_gets_brackets_in_url(self):
+        session = FakeSession([])
+        client = TevaUiClient("2001:db8::10", "admin", "password", session=session)
+        self.assertEqual(client.base_url, "https://[2001:db8::10]")
+        self.assertEqual(client.host, "2001:db8::10")
+        already = TevaUiClient("[2001:db8::11]", "admin", "password", session=FakeSession([]))
+        self.assertEqual(already.base_url, "https://[2001:db8::11]")
+        plain = TevaUiClient("192.0.2.10", "admin", "password", session=FakeSession([]))
+        self.assertEqual(plain.base_url, "https://192.0.2.10")
+        named = TevaUiClient("agent.example.test", "admin", "password", session=FakeSession([]))
+        self.assertEqual(named.base_url, "https://agent.example.test")
+
     def test_tls_protocol_failure_reports_runtime_and_remediation(self):
         client = TevaUiClient(
             "192.0.2.10",

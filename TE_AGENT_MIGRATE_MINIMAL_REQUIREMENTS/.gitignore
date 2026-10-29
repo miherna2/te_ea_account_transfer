@@ -2,5 +2,12 @@
 .venv*/
 inventory.csv
 reports/
+discovery_output/
+report_out/
 __pycache__/
 *.py[cod]
+sandbox_output/
+sandbox_map.json
+
+*.xlsx
+work/
