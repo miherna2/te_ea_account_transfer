@@ -1,0 +1,4 @@
+prefix,group_name,aid,status
+AAAA,Div_A,100,OK
+BBBB,Div_B,200,OK
+CCCC,Div_A,100,REVIEW
