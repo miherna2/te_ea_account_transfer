@@ -85,8 +85,8 @@ Target group rules (re-run guard, every device, with or without ``--owner-is-sou
 -----------------------------------------------------------------------------------
 A device is blocked with "agent is already in the target group (re-run, or owned by the target)"
 when its id (cluster id for clusters) is listed in the target group, or when the target group is in
-its share set. A device that was legitimately shared with the target before the move is blocked
-too: the operator must unshare it first.
+its share set. A device that was legitimately shared with the target before the move is allowed when
+its inventory row lists the target group in ``share_aids``; without that it is blocked too.
 
 Multi-target runs (inventory v3)
 --------------------------------
@@ -124,8 +124,8 @@ OWNER_KEYS = ('ownerAid', 'ownerAccountGroupId')
 REASON_OWNER = 'owner group not proven to be the source group'
 REASON_SHARING = 'cannot read sharing; lab check 1'
 REASON_IN_TARGET = 'agent is already in the target group (re-run, or owned by the target)'
-REASON_IN_TARGET_HINT = ('if the device was shared with the target group before the move, '
-                         'the operator must unshare it first')
+REASON_IN_TARGET_HINT = ('if the device is shared with the target group already, add the target group '
+                         'to the share_aids column of its inventory row (see the README)')
 MAX_IDS_SHOWN = 10
 
 

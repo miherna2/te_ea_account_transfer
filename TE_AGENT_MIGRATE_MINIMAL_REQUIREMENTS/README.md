@@ -140,15 +140,22 @@ agent,MyAgent-02,10.1.1.6,,200
 - Leave `agent_id` empty (or put the current agent ID).
 - Start with one device.
 
-**Optional column `share_aids`.** Leave it out unless you want extra groups to see the agent.
-The new agent is always shared with: the destination group, every group that sees the agent now
-(including the source group) and every group that holds tests of the agent. `share_aids` only adds to
-that list, it never removes a group. If you set it, it must contain `target_aid`.
+**Column `share_aids`.** Usually you leave it out. Add it in one case: **the device is already
+shared with the destination group** (for example, tests of the destination group already run on it).
+Without `share_aids` the dry run blocks that device with "agent is already in the target group",
+to protect you from moving a device that has already been moved. Put the destination group in the
+row to confirm that the sharing is intended:
 
 ```
 type,name,ip_address,agent_id,target_aid,share_aids
-agent,MyAgent-01,10.1.1.5,,200,200;300
+agent,MyAgent-01,10.1.1.5,1234567,200,200;100
 ```
+
+- `share_aids` is a list of group IDs separated by `;`. It must contain `target_aid`.
+- Put the current `agent_id` in the row when you use `share_aids`.
+- The new agent is always shared with: the destination group, every group that sees the agent now
+  (including the source group) and every group that holds tests of the agent. `share_aids` only adds
+  to that list, it never removes a group.
 
 ### 2. Dry run (nothing changes)
 
@@ -332,6 +339,7 @@ python3 -m te_agent_migrate --owner-is-source --repoint-agent-to-agent --apply \
 | owner group not proven to be the source group | Add `--owner-is-source`, only if the source group owns the devices |
 | No agent matches IP and name | Check the name and the IP address in the inventory |
 | N agent-to-agent test(s) use this device as target agent | Add `--repoint-agent-to-agent` to the dry run and to the apply |
+| agent is already in the target group | The device is shared with the destination group already. Add `share_aids` to its inventory row (see step 1). If it was moved before, remove it from the inventory |
 | Already migrated (skipped) | The device is in the destination group already |
 | UI login failed | Check `TE_AGENT_UI_USERNAME` and `TE_AGENT_UI_PASSWORD` |
 | Dry-run confirmation is stale | The inventory changed after the dry run. Run the dry run again |
