@@ -72,26 +72,33 @@ If a variable is missing, the tool asks for it with a hidden prompt.
 
 ## Setup (once)
 
+There is no virtual environment. The tool runs with the Python you already have. One command
+copies the three small libraries it needs (`requests`, `urllib3`, `python-dotenv`) into a `libs`
+folder inside the project. Nothing is installed into your Python and nothing needs activating.
+
 You need Python 3.6 or newer, built with OpenSSL 1.1.1 or newer (TLS 1.3).
 Use a Python from python.org or Homebrew. Apple's `/usr/bin/python3` is too old.
 The computer that runs the tool must reach each agent on TCP 443 and `api.thousandeyes.com`.
 
-**macOS or Linux** (Terminal):
+In the commands of this guide, macOS and Linux use `python3`. On Windows type `python`
+(or `py`) instead.
+
+**macOS or Linux** (Terminal, in the project folder):
 
 ```bash
-PYTHON_BIN=/path/to/python3 ./tools/setup_venv.sh
-. .venv/bin/activate
+python3 -m pip install --target libs -r requirements.txt
+python3 -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
 ```
 
 **Windows** (PowerShell, in the project folder):
 
 ```powershell
-.\tools\setup_venv.ps1 -PythonBin py
-.\.venv\Scripts\Activate.ps1
+python -m pip install --target libs -r requirements.txt
+python -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
 ```
 
-If Windows blocks the scripts, run `Set-ExecutionPolicy -Scope Process Bypass` first.
-Activate the environment again in every new terminal window.
+The last line must end with `True`. If it says `False`, agents that need TLS 1.3 will refuse the
+connection: use a newer Python. To remove the libraries later, delete the `libs` folder.
 
 ## Migrate
 
@@ -152,7 +159,7 @@ export TE_AGENT_UI_USERNAME=admin
 export TE_AGENT_UI_PASSWORD=...
 export TE_TARGET_TOKEN_200=...
 
-python -m te_agent_migrate --owner-is-source \
+python3 -m te_agent_migrate --owner-is-source \
   --inventory work/input/inventory.csv --output work/runs/w1
 ```
 
@@ -179,7 +186,7 @@ The tool asks `y` or `n`, then moves the devices one at a time.
 **macOS or Linux:**
 
 ```bash
-python -m te_agent_migrate --owner-is-source --apply \
+python3 -m te_agent_migrate --owner-is-source --apply \
   --inventory work/input/inventory.csv --output work/runs/w1 \
   --confirmed-dry-run-file work/runs/w1/dry-run-ok.json
 ```
@@ -229,7 +236,7 @@ Use the same flags in the dry run and in the apply, except `--apply` and `--conf
    |
    +-- no  --> nothing to add
 
- Typical first run:   python -m te_agent_migrate --owner-is-source ...
+ Typical first run:   python3 -m te_agent_migrate --owner-is-source ...
  Typical apply:       same flags  +  --apply  +  --confirmed-dry-run-file ...
 ```
 
@@ -290,7 +297,7 @@ type,name,ip_address,agent_id,target_aid
 agent,MyAgent-01,10.1.1.5,,200
 ```
 ```
-python -m te_agent_migrate --owner-is-source --inventory work/input/inventory.csv --output work/runs/w1
+python3 -m te_agent_migrate --owner-is-source --inventory work/input/inventory.csv --output work/runs/w1
 ```
 
 **Several devices to different destinations (one token per destination):**
@@ -309,9 +316,9 @@ agent,MyAgent-03,10.1.1.7,,250
 **The dry run reports agent-to-agent tests:** run both steps again with the extra flag.
 
 ```
-python -m te_agent_migrate --owner-is-source --repoint-agent-to-agent \
+python3 -m te_agent_migrate --owner-is-source --repoint-agent-to-agent \
   --inventory work/input/inventory.csv --output work/runs/w1
-python -m te_agent_migrate --owner-is-source --repoint-agent-to-agent --apply \
+python3 -m te_agent_migrate --owner-is-source --repoint-agent-to-agent --apply \
   --inventory work/input/inventory.csv --output work/runs/w1 \
   --confirmed-dry-run-file work/runs/w1/dry-run-ok.json
 ```
@@ -336,7 +343,7 @@ python -m te_agent_migrate --owner-is-source --repoint-agent-to-agent --apply \
 
 To see before the move what depends on an agent, run `./tools/te_discovery.sh` (read-only, saves your
 account setup to `work/discovery/`), then
-`python -m te_report --input work/discovery --selection selection.txt --output work/reports/w1 --html`.
+`python3 -m te_report --input work/discovery --selection selection.txt --output work/reports/w1 --html`.
 `selection.txt` lists one device name per line.
 
 ## Files
@@ -344,7 +351,7 @@ account setup to `work/discovery/`), then
 ```
 te_agent_migrate/   the migration tool
 te_report/          the optional impact report
-tools/              setup_venv.sh, setup_venv.ps1, te_discovery.sh
+tools/              te_discovery.sh (optional)
 examples/           example input files
 .env.example        the variables (you can use a .env file instead)
 ```
