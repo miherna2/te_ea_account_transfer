@@ -3,9 +3,40 @@
 Moves ThousandEyes Enterprise Agents (TEVA appliances) from one account group to another.
 
 - **Only the agent moves.** The tests stay in their account group and keep their IDs.
-- The tool finds the groups that share the agent and shares the new agent with the same groups.
+- The tool finds the groups that see the agent and shares the new agent with the same groups.
 - It assigns the same tests to the new agent, then deletes the old agent (always last).
 - A dry run is the default. Nothing changes until you apply.
+
+## What happens to one device
+
+```
+BEFORE                                       AFTER
+------                                       -----
+ Group 100 (source)    Group 300             Group 100 (source)    Group 300
+ +-----------------+  +-------------+        +-----------------+  +-------------+
+ | tests T1, T2    |  | test T3     |        | tests T1, T2    |  | test T3     |
+ | agent  A (old)  |  |  (uses A)   |        |  (use agent B)  |  | (uses B)    |
+ +--------+--------+  +------^------+        +-----------------+  +------^------+
+          |  shared with     |                                      shared with
+          +------------------+                Group 200 (destination)    |
+                                              +-----------------+        |
+                                              | agent  B (new)  +--------+
+                                              | same name, same |  also shared back
+                                              | IP, new agent ID|  to group 100
+                                              +-----------------+
+```
+
+The steps, one device at a time:
+
+```
+ 1 read     2 reset     3 register in    4 share B to     5 give B the    6 delete
+ the old    the VM      group 200 with   groups 100, 300  same tests      old agent A
+ agent A    (agent UI)  its token  (B)   (as before)      as A had        (last)
+    |          |            |                 |                |              |
+    +----------+------------+-----------------+----------------+--------------+
+       if anything fails the tool stops and prints the state of that device;
+       the old agent A is deleted only after every step before it worked
+```
 
 ## What you give it
 
@@ -18,6 +49,15 @@ Moves ThousandEyes Enterprise Agents (TEVA appliances) from one account group to
 The tool checks that the name and the IP address belong to the same agent in the source group.
 If they do not match, the device is blocked and nothing is touched. This protects you from moving
 the wrong device.
+
+```
+ inventory line:  MyAgent-01 , 10.1.1.5
+                      |            |
+                      v            v
+ source group 100:  [ agent named MyAgent-01 ]  AND  [ it has IP 10.1.1.5 ]
+                      both true, same agent  ->  READY
+                      anything else          ->  BLOCKED, nothing touched
+```
 
 You also need these secrets. Never put them in a file you share.
 
@@ -55,6 +95,15 @@ Activate the environment again in every new terminal window.
 
 ## Migrate
 
+```
+  [1 inventory]  ->  [2 dry run]  ->  clean?  --no-->  read the reason, fix, repeat step 2
+   (CSV file)        (no changes)       |
+                                       yes: dry-run-ok.json is written
+                                        |
+                                        v
+                                   [3 apply]  ->  moves the devices, one at a time
+```
+
 ### 1. Write the inventory
 
 Make the folder and copy the example.
@@ -78,10 +127,19 @@ agent,MyAgent-02,10.1.1.6,,200
 ```
 
 - `name` and `ip_address` must be exactly those of the agent in the source group.
-- `target_aid` is the destination group ID. Each device can have a different one.
+- `target_aid` is the destination group ID. Each device can have a different one (see the examples).
 - Leave `agent_id` empty (or put the current agent ID).
-- The example file also has an optional `share_aids` column. You can leave it out: the tool finds the groups itself.
 - Start with one device.
+
+**Optional column `share_aids`.** Leave it out unless you want extra groups to see the agent.
+The new agent is always shared with: the destination group, every group that sees the agent now
+(including the source group) and every group that holds tests of the agent. `share_aids` only adds to
+that list, it never removes a group. If you set it, it must contain `target_aid`.
+
+```
+type,name,ip_address,agent_id,target_aid,share_aids
+agent,MyAgent-01,10.1.1.5,,200,200;300
+```
 
 ### 2. Dry run (nothing changes)
 
@@ -112,7 +170,7 @@ python -m te_agent_migrate --owner-is-source `
 ```
 
 A clean dry run writes `work/runs/w1/dry-run-ok.json`.
-If a device is blocked, the output gives the reason (see the table below). Fix it and run again.
+If a device is blocked, the output gives the reason (see "If the dry run says" below). Fix it and run again.
 
 ### 3. Apply (moves the devices)
 
@@ -135,6 +193,7 @@ python -m te_agent_migrate --owner-is-source --apply `
 ```
 
 Do not edit the inventory between the dry run and the apply.
+`dry-run-ok.json` works once and only for the same inventory, groups and flags.
 **Apply resets the real agent. A reset cannot be undone.** Do not press Ctrl-C during a device.
 
 The tool stops at the first failure and prints the state of that device.
@@ -148,32 +207,125 @@ Use the same flags in the dry run and in the apply, except `--apply` and `--conf
 |---|---|---|
 | `--inventory FILE` | The CSV with the devices | Always. Default: `work/input/inventory.csv` |
 | `--output FOLDER` | Folder for the reports, the snapshots and `dry-run-ok.json` | Always. Default: `work/runs`. Use a new folder for each wave |
-| `--owner-is-source` | You confirm that the **source** group owns the devices (see below) | Always, when the source group owns the devices |
-| `--repoint-agent-to-agent` | Points the tests that use a device as their target agent to the new agent | Only if the dry run says "agent-to-agent test(s) use this device as target agent". Add it to the dry run and the apply |
+| `--owner-is-source` | You confirm that the **source** group owns the devices | When the source group owns every device in the inventory (see below) |
+| `--repoint-agent-to-agent` | Points the tests that use a device as their target agent to the new agent | Only when the dry run reports agent-to-agent tests on a device (see below) |
 | `--apply` | Really moves the devices | Only in step 3 |
-| `--confirmed-dry-run-file FILE` | The `dry-run-ok.json` of a clean dry run of the same inventory. It works once | Only with `--apply` |
+| `--confirmed-dry-run-file FILE` | The `dry-run-ok.json` of a clean dry run of the same inventory | Only with `--apply` |
 | `--timeout SECONDS` | How long to wait for each step | Only if a step times out on a slow network |
 | `-v` | More output | When you look for a problem |
 
+### Which flags do I need?
 
-### What is `--owner-is-source`?
+```
+ Do you own the devices in the source group (you registered them there)?
+   |
+   +-- yes --> add  --owner-is-source           (dry run and apply)
+   |
+   +-- no / not sure --> do not move them: see "--owner-is-source" below
 
-An agent that you see in the source group can be owned by that group, or owned by another group and
-shared with it. The ThousandEyes API does not say which. If you move an agent that another group
-owns, that group loses it. So the tool blocks every device until you confirm the owner.
+ Does the dry run say "agent-to-agent test(s) use this device as target agent"?
+   |
+   +-- yes --> add  --repoint-agent-to-agent    (dry run and apply)
+   |
+   +-- no  --> nothing to add
 
-Add `--owner-is-source` when you know that the source group owns the devices, for example because
-you registered them there. If another group owns a device, remove it from the inventory.
+ Typical first run:   python -m te_agent_migrate --owner-is-source ...
+ Typical apply:       same flags  +  --apply  +  --confirmed-dry-run-file ...
+```
+
+### `--owner-is-source`: who owns the agent?
+
+An agent that you see in the source group is either **owned** by that group or only **shared** with it.
+The ThousandEyes API does not tell which. This matters because the move deletes the old agent:
+
+```
+ CASE 1: the source group OWNS the agent         CASE 2: the source group only SEES it
+
+   Group 100 (source)                              Group 500 (owner)
+   +--------------+                                +--------------+
+   | agent A      |  <- registered here            | agent A      |  <- registered here
+   +------+-------+                                +------+-------+
+          | shared with 300                               | shared with 100 (source)
+          v                                               v
+   Group 300 sees A                                Group 100 sees A, but does not own it
+
+   Move A to group 200:                            Move A to group 200:
+   100 gives the agent away. This is               group 500 LOSES its agent.
+   what you want.      -> use the flag             -> do NOT use the flag, take the
+                                                      device out of the inventory
+```
+
+Without `--owner-is-source` the tool blocks every device with "owner not proven", so a mistake
+cannot silently take an agent from another group. The flag is your statement that the source group
+is the owner of **all** devices in the inventory. If the inventory mixes owned and shared devices,
+put only the owned ones in it.
+
+How to know: in the ThousandEyes UI, open the source group, Cloud & Enterprise Agents, Agent Settings.
+An agent you registered in that group (with that group's Account Group Token) is owned by it.
+
+### `--repoint-agent-to-agent`: tests that point at the agent
+
+Most tests only run **from** an agent, so they keep working after the move. An agent-to-agent test
+also uses an agent as its **target**. The new agent has a new ID, so those tests would point at the
+deleted agent. The flag makes the tool change their target to the new agent.
+
+```
+ agent-to-agent test T9 (group 100):   from agent X   --->   target agent A (the device)
+
+ Without the flag the dry run is BLOCKED:
+   "1 agent-to-agent test(s) use this device as target agent"
+
+ With the flag, apply does this:
+   T9:  from agent X ---> target A (old)        becomes        from agent X ---> target B (new)
+```
+
+Use it only when the dry run reports this message. Put it in the dry run **and** in the apply.
+
+## Examples
+
+**One device, source 100 to destination 200 (the usual case):**
+
+```
+type,name,ip_address,agent_id,target_aid
+agent,MyAgent-01,10.1.1.5,,200
+```
+```
+python -m te_agent_migrate --owner-is-source --inventory work/input/inventory.csv --output work/runs/w1
+```
+
+**Several devices to different destinations (one token per destination):**
+
+```
+type,name,ip_address,agent_id,target_aid
+agent,MyAgent-01,10.1.1.5,,200
+agent,MyAgent-02,10.1.1.6,,200
+agent,MyAgent-03,10.1.1.7,,250
+```
+```
+ 100 (source) --+--> MyAgent-01, MyAgent-02 --> 200     needs TE_TARGET_TOKEN_200
+                +--> MyAgent-03             --> 250     needs TE_TARGET_TOKEN_250
+```
+
+**The dry run reports agent-to-agent tests:** run both steps again with the extra flag.
+
+```
+python -m te_agent_migrate --owner-is-source --repoint-agent-to-agent \
+  --inventory work/input/inventory.csv --output work/runs/w1
+python -m te_agent_migrate --owner-is-source --repoint-agent-to-agent --apply \
+  --inventory work/input/inventory.csv --output work/runs/w1 \
+  --confirmed-dry-run-file work/runs/w1/dry-run-ok.json
+```
 
 ## If the dry run says
 
 | Message | What to do |
 |---|---|
-| owner not proven | Add `--owner-is-source` (only if the source group owns the devices) |
+| owner group not proven to be the source group | Add `--owner-is-source`, only if the source group owns the devices |
 | No agent matches IP and name | Check the name and the IP address in the inventory |
 | N agent-to-agent test(s) use this device as target agent | Add `--repoint-agent-to-agent` to the dry run and to the apply |
 | Already migrated (skipped) | The device is in the destination group already |
 | UI login failed | Check `TE_AGENT_UI_USERNAME` and `TE_AGENT_UI_PASSWORD` |
+| Dry-run confirmation is stale | The inventory changed after the dry run. Run the dry run again |
 
 ## After the move
 
