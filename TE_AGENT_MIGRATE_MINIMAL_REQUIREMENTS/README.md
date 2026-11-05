@@ -81,7 +81,9 @@ Use a Python from python.org or Homebrew. Apple's `/usr/bin/python3` is too old.
 The computer that runs the tool must reach each agent on TCP 443 and `api.thousandeyes.com`.
 
 In the commands of this guide, macOS and Linux use `python3`. On Windows type `python`
-(or `py`) instead.
+(or `py`) instead. On Windows use the **Command Prompt**: press the Windows key, type `cmd`, press
+Enter, then go to the project folder with `cd`. In `set NAME=value` do not put quotes around the value. If a password has the characters `& ^ % < >`,
+leave its variable out: the tool then asks for it with a hidden prompt.
 
 **macOS or Linux** (Terminal, in the project folder):
 
@@ -90,9 +92,9 @@ python3 -m pip install --target libs -r requirements.txt
 python3 -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
 ```
 
-**Windows** (PowerShell, in the project folder):
+**Windows** (Command Prompt, in the project folder):
 
-```powershell
+```bat
 python -m pip install --target libs -r requirements.txt
 python -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
 ```
@@ -120,8 +122,8 @@ mkdir -p work/input                                    # macOS or Linux
 cp examples/inventory.example.csv work/input/inventory.csv
 ```
 
-```powershell
-mkdir work\input                                       # Windows
+```bat
+mkdir work\input
 copy examples\inventory.example.csv work\input\inventory.csv
 ```
 
@@ -163,16 +165,16 @@ python3 -m te_agent_migrate --owner-is-source \
   --inventory work/input/inventory.csv --output work/runs/w1
 ```
 
-**Windows (PowerShell):**
+**Windows (Command Prompt):**
 
-```powershell
-$env:TE_SOURCE_AID = "100"
-$env:TE_OAUTH_TOKEN = "..."
-$env:TE_AGENT_UI_USERNAME = "admin"
-$env:TE_AGENT_UI_PASSWORD = "..."
-$env:TE_TARGET_TOKEN_200 = "..."
+```bat
+set TE_SOURCE_AID=100
+set TE_OAUTH_TOKEN=...
+set TE_AGENT_UI_USERNAME=admin
+set TE_AGENT_UI_PASSWORD=...
+set TE_TARGET_TOKEN_200=...
 
-python -m te_agent_migrate --owner-is-source `
+python -m te_agent_migrate --owner-is-source ^
   --inventory work\input\inventory.csv --output work\runs\w1
 ```
 
@@ -191,11 +193,11 @@ python3 -m te_agent_migrate --owner-is-source --apply \
   --confirmed-dry-run-file work/runs/w1/dry-run-ok.json
 ```
 
-**Windows (PowerShell):**
+**Windows (Command Prompt):**
 
-```powershell
-python -m te_agent_migrate --owner-is-source --apply `
-  --inventory work\input\inventory.csv --output work\runs\w1 `
+```bat
+python -m te_agent_migrate --owner-is-source --apply ^
+  --inventory work\input\inventory.csv --output work\runs\w1 ^
   --confirmed-dry-run-file work\runs\w1\dry-run-ok.json
 ```
 
