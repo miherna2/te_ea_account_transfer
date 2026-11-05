@@ -81,18 +81,3 @@ class OperatorPrompter(object):
         answer = self.required_choice("%s?" % prompt, ("y", "n")) == "y"
         self._audit(prompt, "yes" if answer else "no")
         return answer
-
-    def continue_after_batch(self, batch_number, agents):
-        agent_summary = ", ".join(agents)
-        prompt = "Continue after batch %s (%s)" % (batch_number, agent_summary)
-        answer = self.required_choice("%s?" % prompt, ("y", "n")) == "y"
-        self._audit(prompt, "yes" if answer else "no")
-        return answer
-
-    def failure_decision(self, agent, detail, allow_recheck=True):
-        choices = ("recheck", "skip", "abort") if allow_recheck else ("skip", "abort")
-        action_text = "read-only recheck, skip, or abort" if allow_recheck else "skip or abort"
-        prompt = "Failure on %s: %s. Choose %s" % (agent, detail, action_text)
-        answer = self.required_choice(prompt, choices)
-        self._audit(prompt, answer, agent=agent)
-        return answer

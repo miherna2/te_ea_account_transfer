@@ -1,4 +1,4 @@
-"""Read-only preflight for Strategy D.
+"""Read-only preflight.
 
 Resolves every selected agent or cluster in the source group, proves who owns
 it and who it is shared with, checks that it is online and that its name is
@@ -112,7 +112,7 @@ import ipaddress
 from te_agent_migrate.errors import ApiError
 from te_agent_migrate.models import StepStatus
 from te_agent_migrate.output import mask_secrets
-from te_agent_migrate.strategy_d.context import PreflightItem, item_target_aid
+from te_agent_migrate.flow.context import PreflightItem, item_target_aid
 
 STATUS_READY = 'ready'
 STATUS_BLOCKED = 'blocked'

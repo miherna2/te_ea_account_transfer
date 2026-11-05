@@ -17,9 +17,3 @@ class UiError(MigrationError):
 
 class VisibilityTimeout(MigrationError):
     """Destination identity was not confirmed within the operator-selected window."""
-
-class HumanDecisionRequired(MigrationError):
-    """Execution must pause because automated remediation is forbidden."""
-
-class HardStop(MigrationError):
-    """Abort the entire run before touching another agent."""

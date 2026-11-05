@@ -1,4 +1,4 @@
-"""Strategy D batch runner: preflight, then one device at a time.
+"""Batch runner: preflight, then one device at a time.
 
 Rules (see MIGRATION_PLAN.md sections 13 and 14):
 
@@ -17,7 +17,7 @@ Rules (see MIGRATION_PLAN.md sections 13 and 14):
   device may be in an unknown state.
 * Ctrl-C and ``SystemExit`` (any ``BaseException``) during a flow: the device gets a failed
   row ``interrupted``, the devices not started get ``skipped`` rows, the recap is printed, then the
-  exception is re-raised with the ``ResultList`` attached as ``strategy_d_results`` so the caller can
+  exception is re-raised with the ``ResultList`` attached as ``flow_results`` so the caller can
   still write its summary and report.
 * A flow that raises can attach ``new_agent_id``, ``new_cluster_id``, ``snapshot`` and ``state`` to the
   exception (``FlowAborted`` does). They are copied to the failed ``FlowResult``.
@@ -25,16 +25,15 @@ Rules (see MIGRATION_PLAN.md sections 13 and 14):
 
 from te_agent_migrate.models import StepStatus
 from te_agent_migrate.output import mask_secrets
-from te_agent_migrate.strategy_d.cluster import migrate_cluster
-from te_agent_migrate.strategy_d.context import FlowAborted, FlowResult
-from te_agent_migrate.strategy_d.preflight import (
+from te_agent_migrate.flow.cluster import migrate_cluster
+from te_agent_migrate.flow.context import FlowAborted, FlowResult
+from te_agent_migrate.flow.preflight import (
     group_by_target, has_blockers, print_preflight, run_preflight, summarize,
 )
-from te_agent_migrate.strategy_d.standalone import migrate_standalone
+from te_agent_migrate.flow.standalone import migrate_standalone
 
-PLAY_TITLE = 'Strategy D: agent migration'
-TASK_FLOW = 'strategy D : flow result'
-TASK_BATCH = 'strategy D : batch'
+PLAY_TITLE = 'Agent migration'
+TASK_FLOW = 'flow result'
 
 ROW_OK = 'ok'
 ROW_FAILED = 'failed'
@@ -120,13 +119,13 @@ def _failed_result(ctx, name, text, exc):
     )
 
 
-def run_strategy_d(ctx, inventory_agents, console, all_aids=None, stop_on_failure=True,
+def run_migration(ctx, inventory_agents, console, all_aids=None, stop_on_failure=True,
                    assume_owner_source=False):
-    """Run Strategy D for the selected devices. Returns a list of FlowResult."""
+    """Run the migration for the selected devices. Returns a list of FlowResult."""
     results = ResultList()
     rows = results.rows
     mode = 'apply' if ctx.apply else 'dry-run'
-    console.play(PLAY_TITLE, mode, 'D')
+    console.play(PLAY_TITLE, mode)
 
     try:
         items = _call_preflight(ctx, inventory_agents, all_aids, assume_owner_source)
@@ -199,7 +198,7 @@ def run_strategy_d(ctx, inventory_agents, console, all_aids=None, stop_on_failur
 
         if multi and play_target != aid:
             play_target = aid
-            console.play('%s -> Target %s' % (PLAY_TITLE, ctx.target_label(aid)), mode, 'D')
+            console.play('%s -> Target %s' % (PLAY_TITLE, ctx.target_label(aid)), mode)
         device_ctx = ctx.for_target(aid)
         # a snapshot path left by an earlier device must not be reported for this one
         try:
@@ -256,7 +255,7 @@ def run_strategy_d(ctx, inventory_agents, console, all_aids=None, stop_on_failur
         console.info('run', 'run interrupted; the device above may be in an unknown state')
         console.recap(rows)
         try:
-            interrupted.strategy_d_results = results
+            interrupted.flow_results = results
         except (AttributeError, TypeError):
             pass
         raise interrupted

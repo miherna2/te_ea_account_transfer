@@ -48,6 +48,13 @@ def _api_reason(response, limit=400):
     return ": " + mask_secrets(" ".join(" ".join(parts).split()))[:limit]
 
 
+RESPONSE_ONLY_FIELDS = frozenset({
+    '_links', 'apiLinks', 'createdBy', 'createdDate', 'createdAt', 'id', 'liveShare', 'modifiedBy',
+    'modifiedDate', 'modifiedAt', 'savedEvent', 'sslVersion', 'testId', 'testResults', 'testType',
+    'type', 'versionId',
+})  # fields of a test GET that a PUT must not send back
+
+
 class AmbiguousAgentMatch(ApiError):
     """More than one new agent qualifies as the registered device. The caller must stop."""
 
@@ -531,9 +538,6 @@ class ThousandEyesApiClient(object):
             safe_to_retry=False,
         )
 
-    def list_monitors(self, aid):
-        return list(self._paginate("monitors", "monitors", aid=aid))
-
     def create_tag(self, aid, payload):
         response = self.request(
             "POST", "tags", aid=aid, json_body=payload, expected=set((200, 201)), safe_to_retry=False
@@ -627,110 +631,6 @@ class ThousandEyesApiClient(object):
                 values.add(str(value))
         return values
 
-    @staticmethod
-    def _test_monitor_ids(test):
-        values = set()
-        raw_monitors = test.raw.get("monitors", [])
-        if not isinstance(raw_monitors, list):
-            return values
-        for monitor in raw_monitors:
-            value = monitor.get("monitorId", monitor.get("id")) if isinstance(monitor, dict) else monitor
-            if value is not None and str(value):
-                values.add(str(value))
-        return values
-
-    def wait_for_test_ready(
-        self,
-        aid,
-        test_type,
-        test_id,
-        agent_id,
-        timeout_seconds,
-        poll_interval_seconds=5.0,
-        on_poll=None,
-    ):
-        deadline = self._monotonic() + timeout_seconds
-        poll_number = 0
-        while True:
-            poll_number += 1
-            remaining = max(0.0, deadline - self._monotonic())
-            if on_poll is not None:
-                on_poll(poll_number, remaining)
-            test = self.get_test(aid, test_type, test_id)
-            if test.enabled and agent_id in self._test_agent_ids(test):
-                return test
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                raise VisibilityTimeout(
-                    "Target test %s was not enabled and assigned to agent %s within %s seconds"
-                    % (test_id, agent_id, timeout_seconds)
-                )
-            self._sleep(min(poll_interval_seconds, remaining))
-
-    def wait_for_monitor_test_ready(
-        self,
-        aid,
-        test_type,
-        test_id,
-        expected_name,
-        expected_prefix,
-        expected_use_public_bgp,
-        expected_monitor_ids,
-        timeout_seconds,
-        poll_interval_seconds=5.0,
-        on_poll=None,
-    ):
-        deadline = self._monotonic() + timeout_seconds
-        poll_number = 0
-        while True:
-            poll_number += 1
-            remaining = max(0.0, deadline - self._monotonic())
-            if on_poll is not None:
-                on_poll(poll_number, remaining)
-            test = self.get_test(aid, test_type, test_id)
-            ready = (
-                test.enabled
-                and test.name == expected_name
-                and str(test.raw.get("prefix", "")) == expected_prefix
-                and bool(test.raw.get("usePublicBgp", False)) is expected_use_public_bgp
-                and self._test_monitor_ids(test) == expected_monitor_ids
-                and not self._test_agent_ids(test)
-            )
-            if ready:
-                return test
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                raise VisibilityTimeout(
-                    "Target monitor-based test %s did not become enabled with its exact configuration within %s seconds"
-                    % (test_id, timeout_seconds)
-                )
-            self._sleep(min(poll_interval_seconds, remaining))
-
-    def wait_for_test_absent(
-        self,
-        aid,
-        test_id,
-        timeout_seconds,
-        poll_interval_seconds=5.0,
-        on_poll=None,
-    ):
-        deadline = self._monotonic() + timeout_seconds
-        poll_number = 0
-        while True:
-            poll_number += 1
-            remaining = max(0.0, deadline - self._monotonic())
-            if on_poll is not None:
-                on_poll(poll_number, remaining)
-            if all(test.test_id != test_id for test in self.list_tests(aid)):
-                return
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                raise VisibilityTimeout(
-                    "Source test %s was still returned within %s seconds after deletion"
-                    % (test_id, timeout_seconds)
-                )
-            self._sleep(min(poll_interval_seconds, remaining))
-
     def delete_agent(self, aid, agent_id, agent_type=None):
         if str(agent_type or "").casefold() == CLUSTER_AGENT_TYPE:
             raise ApiError(
@@ -774,7 +674,6 @@ class ThousandEyesApiClient(object):
         Shared by ``set_test_enabled`` and ``set_agent_to_agent_target``.
         """
         from copy import deepcopy
-        from te_agent_migrate.strategies import RESPONSE_ONLY_FIELDS  # late import: strategies imports this module
 
         payload = deepcopy(test.raw)
         for field in RESPONSE_ONLY_FIELDS:

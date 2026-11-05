@@ -1,4 +1,4 @@
-"""Shared context for Strategy D flows."""
+"""Shared context for the migration flows."""
 import copy
 import json
 import os
@@ -98,7 +98,7 @@ def _pick(mapping, keys):
 
 
 class FlowContext(object):
-    """Everything a Strategy D flow needs. Build one per run.
+    """Everything a flow needs. Build one per run.
 
     api                  ThousandEyesApiClient (wrapped by ReadOnlyApi when ``apply`` is False)
     ui_factory           callable(host_or_ip) -> context manager yielding TevaUiClient
@@ -117,7 +117,7 @@ class FlowContext(object):
     snapshot_dir         directory for the JSON snapshot written before the first destructive call
                          (None = no file is written; an info line says so)
     snapshot_path        path of the last snapshot file written (None until written)
-    repoint_a2a          Strategy D standalone only (``--repoint-agent-to-agent``, default False). True = preflight
+    repoint_a2a          Standalone agents only (``--repoint-agent-to-agent``, default False). True = preflight
                          does not block a device that agent-to-agent tests target; the flow repoints those tests to
                          the new agent id after the move (step 'repoint a2a targets'). Preflight reads it; the
                          copy made by ``for_target`` keeps it.

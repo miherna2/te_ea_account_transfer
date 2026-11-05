@@ -1,4 +1,4 @@
-"""Strategy D: Enterprise Agent cluster flow (maintenance window).
+"""Enterprise Agent cluster flow (maintenance window).
 
 A cluster cannot move as one unit. The flow takes it apart and builds it again:
 
@@ -31,8 +31,8 @@ both modes give the same verdict.
 from te_agent_migrate.api_client import AmbiguousAgentMatch, ThousandEyesApiClient
 from te_agent_migrate.errors import AuthenticationError, UiError, VisibilityTimeout
 from te_agent_migrate.models import StepStatus
-from te_agent_migrate.strategy_d.context import FlowAborted, FlowResult, attach_stop_info
-from te_agent_migrate.strategy_d.standalone import (
+from te_agent_migrate.flow.context import FlowAborted, FlowResult, attach_stop_info
+from te_agent_migrate.flow.standalone import (
     MANUAL_RULES_TEXT,
     _aid_key,
     _desired_groups,
@@ -1046,7 +1046,7 @@ def _stop_line(ctx, item, progress, exc):
 
 
 def migrate_cluster(ctx, item):
-    """Run the Strategy D cluster flow for one ready cluster. Returns FlowResult.
+    """Run the cluster flow for one ready cluster. Returns FlowResult.
 
     A flow that stops re-raises its exception with ``new_agent_id`` (first new member agent, or None),
     ``new_cluster_id`` (None until the new cluster is confirmed), ``snapshot`` and ``state`` set as attributes

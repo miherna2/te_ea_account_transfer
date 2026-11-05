@@ -116,12 +116,11 @@ class MigrationConsole(object):
             self._write("!" * 72 + "\n")
 
     # ------------------------------------------------------------------ play / task
-    def play(self, title, mode, strategy):
+    def play(self, title, mode):
         mode_text = str(getattr(mode, "value", mode)).upper()
-        strategy_text = str(getattr(strategy, "value", strategy))
         with self._lock:
             self._write("\n" + _stars("PLAY [%s]" % self._clean(title)))
-            self._write("MODE: %s   STRATEGY: %s" % (mode_text, strategy_text))
+            self._write("MODE: %s" % mode_text)
             self._last_task = None
 
     def task(self, name):

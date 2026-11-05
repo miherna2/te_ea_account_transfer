@@ -155,7 +155,6 @@ Use the same flags in the dry run and in the apply, except `--apply` and `--conf
 | `--timeout SECONDS` | How long to wait for each step | Only if a step times out on a slow network |
 | `-v` | More output | When you look for a problem |
 
-There is no `--strategy` flag. The tool has one way of moving an agent.
 
 ### What is `--owner-is-source`?
 

@@ -1,4 +1,4 @@
-"""Strategy D: standalone Enterprise Agent flow.
+"""Standalone Enterprise Agent flow.
 
 Tests stay in the source account group and keep their IDs. The agent is reset,
 registered in the target group, shared back to every group that saw it, and
@@ -27,7 +27,7 @@ from te_agent_migrate.api_client import AmbiguousAgentMatch, ThousandEyesApiClie
 from te_agent_migrate.errors import AuthenticationError, UiError, VisibilityTimeout
 from te_agent_migrate.models import StepStatus
 from te_agent_migrate.output import mask_secrets
-from te_agent_migrate.strategy_d.context import FlowAborted, FlowResult, a2a_targets_of, attach_stop_info
+from te_agent_migrate.flow.context import FlowAborted, FlowResult, a2a_targets_of, attach_stop_info
 from te_agent_migrate.ui_client import boolean_from_snapshot
 
 STEP_PREFLIGHT = 'preflight_snapshot'
@@ -534,7 +534,7 @@ def _stop_line(ctx, state, exc, item=None):
 
 
 def migrate_standalone(ctx, item):
-    """Run the Strategy D standalone flow for one ready agent. Returns FlowResult.
+    """Run the standalone flow for one ready agent. Returns FlowResult.
 
     A flow that stops re-raises its exception with ``new_agent_id``, ``new_cluster_id`` (always None here),
     ``snapshot`` and ``state`` set as attributes (the runner reads them with ``getattr``).

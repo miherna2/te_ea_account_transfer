@@ -15,18 +15,6 @@ class Mode(ValueEnum):
     APPLY = "apply"
 
 
-class TestStrategy(ValueEnum):
-    AGENTS_ONLY = "A"
-    SHARE = "B"
-    RECREATE = "C"
-    DIRECT_SHARE = "D"
-
-
-class StalePolicy(ValueEnum):
-    KEEP = "keep"
-    REMOVE = "remove"
-
-
 class StepStatus(ValueEnum):
     OK = "ok"
     CHANGED = "changed"
@@ -328,36 +316,3 @@ class StepEvent(_Record):
         self.duration_seconds = duration_seconds
         self.detail = detail
         self.data = dict(data or {})
-
-
-class RunOptions(_Record):
-    _field_names = (
-        "mode",
-        "strategy",
-        "stale_policy",
-        "timeout_seconds",
-        "parallelism",
-        "verbose",
-        "create_missing_tags",
-        "create_missing_alerts",
-    )
-
-    def __init__(
-        self,
-        mode,
-        strategy,
-        stale_policy,
-        timeout_seconds=180,
-        parallelism=1,
-        verbose=False,
-        create_missing_tags=False,
-        create_missing_alerts=False,
-    ):
-        self.mode = mode
-        self.strategy = strategy
-        self.stale_policy = stale_policy
-        self.timeout_seconds = timeout_seconds
-        self.parallelism = parallelism
-        self.verbose = verbose
-        self.create_missing_tags = create_missing_tags
-        self.create_missing_alerts = create_missing_alerts
