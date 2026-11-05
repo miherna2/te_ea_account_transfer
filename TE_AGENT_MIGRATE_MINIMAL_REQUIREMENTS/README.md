@@ -260,8 +260,8 @@ cannot silently take an agent from another group. The flag is your statement tha
 is the owner of **all** devices in the inventory. If the inventory mixes owned and shared devices,
 put only the owned ones in it.
 
-How to know: in the ThousandEyes UI, open the source group, Cloud & Enterprise Agents, Agent Settings.
-An agent you registered in that group (with that group's Account Group Token) is owned by it.
+How to know: an agent that was registered with the source group's own Account Group Token is owned
+by the source group. If you are not sure, ask the team that installed the agent before you move it.
 
 ### `--repoint-agent-to-agent`: tests that point at the agent
 
