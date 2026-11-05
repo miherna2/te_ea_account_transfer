@@ -33,11 +33,15 @@ Safety rules:
 - Python 3.6 or newer.
 - Python must use OpenSSL 1.1.1 or newer (TLS 1.3).
 - Access to the ThousandEyes API and to each agent on TCP 443.
+- For discovery: `curl`, `jq`, `awk`.
 - An API v7 token, the agent UI login, one registration token per target group.
 
 Apple's `/usr/bin/python3` uses LibreSSL 2.8.3.
 It cannot connect to agents that need TLS 1.3.
 Use a Python.org or Homebrew Python.
+
+TODO: Confirm if the scope module needs `openpyxl` to read `.xlsx` files.
+It is not in `requirements.txt`.
 
 ## Setup
 
@@ -63,77 +67,46 @@ python -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
 
 `.env` is not committed. The variables are listed in `.env.example`.
 
-## Inventory file
-
-The inventory is a CSV file that lists the devices to move.
-Copy `examples/inventory.example.csv` to `work/input/inventory.csv` and edit it.
-
-```
-type,name,ip_address,agent_id,target_aid,share_aids
-agent,AAAA - HOST01,192.0.2.11,5001,100,100;900;400
-agent,AAAA - HOST02,192.0.2.12,5002,100,100;900;300
-agent,BBBB - HOST03,192.0.2.13,,200,200;900
-```
-
-| Column | Required | Meaning |
-|---|---|---|
-| `type` | yes | `agent` for a single agent (`cluster` for a cluster) |
-| `name` | yes | Agent name, exactly as the agent list shows it |
-| `ip_address` | yes for `agent` | The IP address of the agent (its UI must answer on TCP 443) |
-| `agent_id` | no | Current agent ID, digits only. With it the tool also skips a device that already moved |
-| `target_aid` | no | ID of the account group that receives this device. Empty: `TE_TARGET_AID` |
-| `share_aids` | no | Account group IDs, separated by `;`. Must contain `target_aid`. Empty: the tool shares the new agent with the groups that see the old agent today, plus the target |
-
-Rules:
-
-- Keep the header and the column order. After `ip_address`, each of the last three columns is optional.
-- Names and IP addresses must be unique. IDs have digits only. Do not add credential columns.
-- One row for each device. Leave an optional value empty, but keep the comma.
-- Each row may name its own target group. You need one registration token for each target group.
-
-Find the IDs with the API (use the API v7 token in `TE_OAUTH_TOKEN`):
-
-```bash
-curl -s -H "Authorization: Bearer $TE_OAUTH_TOKEN" \
-  https://api.thousandeyes.com/v7/account-groups
-curl -s -H "Authorization: Bearer $TE_OAUTH_TOKEN" \
-  "https://api.thousandeyes.com/v7/agents?agentTypes=ENTERPRISE&aid=<source group id>"
-```
-
-The first call lists account group names and IDs (`aid`). The second lists the agents of
-the source group with their `agentId`, `agentName` and IP addresses.
-
-Do not edit the inventory between the dry run and the apply. The dry-run file stores a hash of it.
-
 ## Quick start
 
-1. Set the access in `.env` (see `.env.example`) or in the shell:
+The input is an Excel file in `work/input/`. Never commit it.
+
+1. Discover. This step only reads. It writes `work/discovery/`.
 
    ```bash
-   export TE_OAUTH_TOKEN=...                 # API v7 token
-   export TE_SOURCE_AID=...                  # ID of the source account group
-   export TE_AGENT_UI_USERNAME=...           # agent UI login
-   export TE_AGENT_UI_PASSWORD=...
-   export TE_TARGET_TOKEN_<aid>=...          # registration token of each target group
+   ./tools/te_discovery.sh
    ```
 
-   Without a variable the tool asks for the value in a hidden prompt.
-   The tool never prints or stores tokens or passwords.
+2. Build the scope from the Excel file.
 
-2. Make `work/input/inventory.csv` (section above). Start with one device.
+   ```bash
+   python -m te_agent_migrate.scope --xlsx work/input/scope.xlsx --out work/input
+   ```
 
-3. Do a dry run. Nothing changes.
+   It writes `prefix_map.csv`, `inventory.csv` and `scope_report.csv`.
+   Exit code 3 means that a prefix needs review.
+
+3. Edit `work/input/prefix_map.csv`. Set each prefix status to `OK`.
+   Run step 2 again.
+
+   TODO: Confirm that the scope module reads the edited `prefix_map.csv`.
+
+4. Make the impact report. `selection.txt` lists the device names
+   of `inventory.csv`.
+
+   ```bash
+   python -m te_report --input work/discovery \
+     --selection work/input/selection.txt --output work/reports/wave1 --html
+   ```
+
+5. Do a dry run. Nothing changes.
 
    ```bash
    python -m te_agent_migrate --strategy D --owner-is-source \
      --inventory work/input/inventory.csv --output work/runs/wave1
    ```
 
-   Use `--owner-is-source` only when the source group owns every device.
-   A clean dry run writes `work/runs/wave1/dry-run-ok.json`.
-   If a device is blocked, the output gives the reason. Fix the inventory or the cause and run again.
-
-4. Apply. Use the file that the clean dry run wrote. The tool asks `y` or `n` before it starts.
+6. Apply. Use the file that the clean dry run wrote.
 
    ```bash
    python -m te_agent_migrate --strategy D --owner-is-source --apply \
@@ -144,9 +117,6 @@ Do not edit the inventory between the dry run and the apply. The dry-run file st
 WARNING: Apply resets real agents. A reset cannot be undone.
 Do a clean dry run first, and move one wave at a time.
 
-If a test uses a device as the target of an agent-to-agent test, add `--repoint-agent-to-agent`
-to the dry run and to the apply. The tool then points those tests to the new agent.
-
 ## Directory tree
 
 ```
@@ -154,10 +124,12 @@ to the dry run and to the apply. The tool then points those tests to the new age
 +-- README.md, requirements.txt, .env.example
 +-- te_agent_migrate/     production tool (strategy_d/ = Strategy D flows)
 +-- te_report/            production offline report
-+-- tools/                setup_venv.sh, setup_venv.ps1
++-- tools/                te_discovery.sh, setup_venv.sh, setup_venv.ps1
 +-- examples/             example input files
 +-- work/                 not committed
-    +-- input/            inventory.csv
+    +-- input/            Excel file, prefix map, inventory
+    +-- discovery/        output of te_discovery.sh
+    +-- reports/          output of te_report
     +-- runs/             dry-run files, snapshots, run reports
 ```
 
