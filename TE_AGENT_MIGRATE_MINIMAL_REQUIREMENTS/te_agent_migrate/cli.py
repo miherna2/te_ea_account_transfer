@@ -84,70 +84,56 @@ def _parallelism(value):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="te-agent-migrate",
-        description="Migrate ThousandEyes Enterprise Agents between account groups.",
+        description=(
+            "Move ThousandEyes Enterprise Agents to other account groups. Only the agent moves: "
+            "its tests stay in their account group, and the agent is shared back and gets the "
+            "same tests. Dry run is the default."
+        ),
     )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Preview only (default).")
-    mode.add_argument("--apply", action="store_true", help="Execute the migration.")
+    mode.add_argument("--dry-run", action="store_true", help="Preview only. This is the default.")
+    mode.add_argument("--apply", action="store_true", help="Move the devices. Needs --confirmed-dry-run-file.")
     parser.add_argument(
         "--inventory",
         default="work/input/inventory.csv",
         help=(
-            "Inventory CSV path. Columns: type,name,ip_address[,agent_id][,target_aid][,share_aids] "
-            "(inventory v3; the last three are optional, in this order). "
-            "Strategy D: a row target_aid overrides the run target for that device."
+            "Inventory CSV (default work/input/inventory.csv). Columns: "
+            "type,name,ip_address[,agent_id][,target_aid][,share_aids]. The last three are "
+            "optional, in this order. target_aid is the destination group of that device."
         ),
     )
     parser.add_argument(
         "--strategy",
-        help=(
-            "A=agents only, B=share tests, C=recreate tests (apply is blocked; "
-            "tests cannot stay in the source group), D=move the agent and keep the "
-            "tests in the source group (share back and assign). "
-            "D moves only the devices listed in the inventory and runs one device at a time. "
-            "D reads the v3 columns: target_aid is the target group of the row and overrides "
-            "the run target (TE_TARGET_AID); share_aids lists the groups that must see the "
-            "device after the move. When every row has a target_aid, the run target is not "
-            "needed. Each target group needs its own registration token "
-            "(TE_TARGET_TOKEN_<aid>, or a hidden prompt). A, B and C ignore these columns."
-        ),
+        help=argparse.SUPPRESS,  # Strategy D is the only one; "--strategy D" is still accepted.
     )
     parser.add_argument(
         "--owner-is-source",
         dest="owner_is_source",
         action="store_true",
         help=(
-            "Strategy D: state that the source account group OWNS every selected device. "
-            "The API gives no owner field, so preflight blocks every device without this flag. "
-            "A device whose data names another owner is still blocked."
+            "Confirm that the SOURCE account group owns the devices in the inventory. "
+            "The ThousandEyes API does not say which group owns an agent, so the tool cannot "
+            "check this itself and blocks every device unless you give this flag. Use it only "
+            "when the source group really owns them."
         ),
     )
     parser.add_argument(
         "--auto-reenable-tests",
         dest="auto_reenable_tests",
         action="store_true",
-        help=(
-            "Strategy D only (default off): after a cluster is rebuilt, re-enable the tests that "
-            "the unassign disabled. Without this flag the tool prints a manual list. "
-            "Uses a full-payload PUT; lab check 7 must pass first."
-        ),
+        help=argparse.SUPPRESS,  # clusters only
     )
     parser.add_argument(
         "--repoint-agent-to-agent",
         dest="repoint_agent_to_agent",
         action="store_true",
         help=(
-            "Strategy D only (default off; ignored with an info line for A, B and C): after a move the "
-            "device has a NEW agent id, and agent-to-agent tests name their target by id. Without this "
-            "flag preflight BLOCKS every device that such a test targets. With this flag preflight does "
-            "not block; it warns '<N> agent-to-agent test(s) will be repointed after the move' and "
-            "records each test (account group, test id, old target id). After the new agent is online, "
-            "shared and has its tests, and BEFORE the old agent is deleted, the tool changes only "
-            "targetAgentId of each recorded test to the new id (full-payload PUT, then a read-back). If "
-            "one test fails, the old agent is kept. A test whose targetAgentId cannot be read becomes a "
-            "BLOCKER (the repoint cannot be proven safe). A cluster that such a test targets is a BLOCKER "
-            "(not supported). The snapshot file lists the old target ids, so you can undo by hand. The "
-            "dry-run file binds the flag and the tests. Lab check: the PUT must change nothing else."
+            "Use it when other tests (agent-to-agent tests) use a device as their target agent. "
+            "After a move the device has a new agent ID, so those tests must point to it. "
+            "Without this flag the dry run blocks such devices and names the tests. With it, the "
+            "tool changes only the target agent of those tests, after the new agent is online and "
+            "has its tests and before the old agent is deleted. Give it in the dry run AND in "
+            "the apply."
         ),
     )
     parser.add_argument(
@@ -155,37 +141,28 @@ def build_parser():
         dest="confirmed_dry_run_file",
         metavar="PATH",
         help=(
-            "Strategy D with --apply: path to the dry-run-ok.json that a clean dry run "
-            "of the same inventory wrote into the report directory. The file is bound to the "
-            "ready devices and their shares, and it is single use (renamed to .used at start)."
+            "Needed with --apply. The dry-run-ok.json file that a clean dry run of the same "
+            "inventory wrote into its --output folder. It works once."
         ),
     )
-    parser.add_argument("--stale", help="Strategy C source-test policy: keep or remove.")
-    parser.add_argument(
-        "--create-missing-tags",
-        action="store_true",
-        help="Strategy C: create/reuse missing target test tags.",
-    )
-    parser.add_argument(
-        "--create-missing-alerts",
-        action="store_true",
-        help="Strategy C: create/reuse missing target alert rules.",
-    )
+    parser.add_argument("--stale", help=argparse.SUPPRESS)
+    parser.add_argument("--create-missing-tags", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--create-missing-alerts", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--timeout",
         type=_positive_integer,
         default=None,
-        help="Wait limit in seconds (A/B/C default 180; D uses the flow default).",
+        help="Wait limit in seconds for each wait step (optional).",
     )
     parser.add_argument(
         "--parallel",
         type=_parallelism,
         default=1,
         dest="parallelism",
-        help="Parallel connections (1-5). Strategy D always uses 1.",
+        help=argparse.SUPPRESS,  # ignored: devices move one at a time
     )
-    parser.add_argument("--output", default="work/runs", help="Artifact directory.")
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--output", default="work/runs", help="Folder for reports, snapshots and the dry-run file.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="More output.")
     return parser
 
 
@@ -928,12 +905,11 @@ def _main(argv=None):
         console.progress("global", "inventory", "reading %s" % inventory)
         agents = load_inventory(inventory)
         console.status(StepStatus.OK, "global", "inventory", "loaded %s agent(s)" % len(agents))
-        strategy_value = args.strategy or prompter.required_choice(
-            "Test-handling strategy", ("A", "B", "C", "D")
-        )
-        strategy_value = strategy_value.upper()
-        if strategy_value not in ("A", "B", "C", "D"):
-            raise ConfigurationError("--strategy must be A, B, C, or D")
+        strategy_value = (args.strategy or "D").upper()
+        if strategy_value != "D":
+            raise ConfigurationError(
+                "Only Strategy D exists. Remove --strategy (it is no longer needed)."
+            )
         selected_strategy = TestStrategy(strategy_value)
         report.record_decision("Test-handling strategy", selected_strategy.value)
         is_strategy_d = selected_strategy is TestStrategy.DIRECT_SHARE
