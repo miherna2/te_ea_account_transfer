@@ -739,9 +739,14 @@ def _run_migration(
     code = _exit_code(console, results)
     clean = code == EXIT_OK
     confirmation = None
+    nothing_ready = False
     if not apply_mode:
+        preflight_items = getattr(results, "preflight_items", None) or []
+        nothing_ready = clean and not any(
+            getattr(item, "status", None) == "ready" for item in preflight_items
+        )
         confirmation = _update_dry_run_confirmation(
-            output, clean and not getattr(results, "blocked", False),
+            output, clean and not nothing_ready and not getattr(results, "blocked", False),
             inventory_path, source, default_target_aid, agents,
             items=getattr(results, "preflight_items", None), owner_is_source=owner_is_source,
             target_aids=all_target_aids, repoint_a2a=repoint_a2a,
@@ -755,6 +760,12 @@ def _run_migration(
         console.info(
             "run",
             "clean dry run; apply needs --confirmed-dry-run-file %s" % confirmation,
+        )
+    elif nothing_ready:
+        console.info(
+            "run",
+            "nothing to migrate: no device is ready (see the excluded devices above); "
+            "%s was not written" % DRY_RUN_OK_FILENAME,
         )
     elif not apply_mode:
         console.info("run", "dry run is not clean; %s was not written" % DRY_RUN_OK_FILENAME)
