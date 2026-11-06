@@ -33,8 +33,10 @@ from te_agent_migrate.errors import AuthenticationError, UiError, VisibilityTime
 from te_agent_migrate.models import StepStatus
 from te_agent_migrate.flow.context import FlowAborted, FlowResult, attach_stop_info
 from te_agent_migrate.flow.standalone import (
+    ASSIGN_CHUNK_SIZE,
     MANUAL_RULES_TEXT,
     _aid_key,
+    assign_until_present,
     _desired_groups,
     _format_aids,
     _identity_matches,
@@ -68,7 +70,7 @@ STEP_RENAME = 'cluster_rename'
 STEP_RESTORE_TAGS = 'cluster_restore_tags'
 STEP_MANUAL_RULES = 'manual_notification_rules'
 
-ASSIGN_CHUNK_SIZE = 100
+# ASSIGN_CHUNK_SIZE (imported from standalone) is 10: a call with 81 tests timed out in the field.
 IDS_PER_LINE = 50
 MIN_MEMBERS = 2
 MAINTENANCE_TEXT = ('MAINTENANCE WINDOW STARTED: all tests on this cluster have no agent until the new cluster '
@@ -770,14 +772,11 @@ def _assign_tests(ctx, item, host, progress, new_cluster_id):
     detail = 'assigned %d tests in %d groups to cluster %s and verified' % (_tests_total(item), len(aids), new_cluster_id)
     with ctx.step(host, STEP_ASSIGN_TESTS, detail, changed=True):
         for aid in aids:
-            ids = item.tests_by_aid[aid]
-            chunks = _chunks(ids, ASSIGN_CHUNK_SIZE)
-            for number, chunk in enumerate(chunks, 1):
-                ctx.api.assign_tests(aid, new_cluster_id, chunk)
-                progress.assigned_count += len(chunk)
-                if len(chunks) > 1:
-                    ctx.console.info(host, 'aid %s: assign call %d/%d done (%d of %d tests)'
-                                     % (aid, number, len(chunks), min(number * ASSIGN_CHUNK_SIZE, len(ids)), len(ids)))
+            def count_batch(size):
+                progress.assigned_count += size
+
+            assign_until_present(ctx, host, aid, new_cluster_id, item.tests_by_aid[aid],
+                                 'old members were NOT deleted', on_batch=count_batch)
             progress.assigned_groups.append(aid)
         for aid in aids:
             needed = set(item.tests_by_aid[aid])

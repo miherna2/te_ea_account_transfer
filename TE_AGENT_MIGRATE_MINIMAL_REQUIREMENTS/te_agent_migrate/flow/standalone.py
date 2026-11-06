@@ -40,7 +40,8 @@ STEP_UI_TOKEN = 'ui_set_target_token'
 STEP_TARGET_ONLINE = 'api_target_online'
 STEP_SHARE_BACK = 'api_share_back'
 STEP_ASSIGN_TESTS = 'api_assign_tests'
-ASSIGN_CHUNK_SIZE = 10
+ASSIGN_CHUNK_SIZE = 10  # tests per assign call; 81 in one call timed out (30 s)
+ASSIGN_ROUNDS = 3       # send, check, resend only what is missing
 STEP_REPOINT_A2A = 'repoint a2a targets'
 STEP_DELETE_OLD = 'api_delete_old'
 STEP_RENAME = 'api_rename'
@@ -369,6 +370,55 @@ def _share_back(ctx, item, new_id):
                               % (new_id, _format_aids(missing)))
 
 
+def _tests_on(ctx, aid, agent_id):
+    """Ids of the tests that ``agent_id`` has in group ``aid`` right now (read only)."""
+    for record in ctx.api.list_agents_with_clusters(aid):
+        if record.agent_id == agent_id:
+            return set(str(t) for t in record.test_ids)
+    return set()
+
+
+def assign_until_present(ctx, host, aid, agent_id, test_ids, kept_text, on_batch=None):
+    """Add ``test_ids`` to the agent in small batches until the API shows all of them.
+
+    Why: one call with 81 tests hit the 30 s read timeout; the tests of the other groups were
+    never tried and the flow stopped half done. Now:
+      * a call carries at most ASSIGN_CHUNK_SIZE tests;
+      * a call that fails (timeout, 5xx) is not the end: the next round reads what the agent has
+        and sends only what is still missing (adding tests is safe to repeat);
+      * after ASSIGN_ROUNDS rounds with tests still missing it raises FlowAborted with the last error.
+    It only adds tests. It never removes one.
+    """
+    wanted = [str(t) for t in test_ids]
+    last_error = None
+    for round_number in range(1, ASSIGN_ROUNDS + 1):
+        missing = [t for t in wanted if t not in _tests_on(ctx, aid, agent_id)]
+        if not missing:
+            return
+        if round_number > 1:
+            ctx.console.info(host, 'aid %s: %d test(s) still missing; round %d of %d'
+                             % (aid, len(missing), round_number, ASSIGN_ROUNDS))
+        for start in range(0, len(missing), ASSIGN_CHUNK_SIZE):
+            batch = missing[start:start + ASSIGN_CHUNK_SIZE]
+            try:
+                ctx.api.assign_tests(aid, agent_id, batch)
+            except Exception as exc:  # not fatal: the next round checks what really arrived
+                last_error = mask_secrets(str(exc)) or exc.__class__.__name__
+                ctx.console.info(host, 'aid %s: a batch of %d test(s) failed (%s); will check and retry'
+                                 % (aid, len(batch), last_error))
+                continue
+            if on_batch is not None:
+                on_batch(len(batch))
+            ctx.console.info(host, 'aid %s: assigned %d test(s) (%d of %d)'
+                             % (aid, len(batch), min(start + ASSIGN_CHUNK_SIZE, len(missing)), len(missing)))
+        ctx.sleep(ctx.poll_seconds if ctx.poll_seconds and ctx.poll_seconds > 0 else 1)
+    missing = [t for t in wanted if t not in _tests_on(ctx, aid, agent_id)]
+    if missing:
+        raise FlowAborted('aid %s: %d of %d tests are not assigned to %s after %d rounds (%s); last error: %s; %s'
+                          % (aid, len(missing), len(wanted), agent_id, ASSIGN_ROUNDS, ','.join(missing[:10]),
+                             last_error or 'none', kept_text))
+
+
 def _assign_tests(ctx, item, new_id):
     aids = _test_aids(item)
     if not aids:
@@ -377,10 +427,8 @@ def _assign_tests(ctx, item, new_id):
     detail = 'assigned %s to agent %s and verified' % (_assign_text(item), new_id)
     with ctx.step(item.name, STEP_ASSIGN_TESTS, detail, changed=True):
         for aid in aids:
-            ids = list(item.tests_by_aid[aid])
-            # One call with 81 tests timed out at the customer (30 s limit). Small batches stay under it.
-            for start in range(0, len(ids), ASSIGN_CHUNK_SIZE):
-                ctx.api.assign_tests(aid, new_id, ids[start:start + ASSIGN_CHUNK_SIZE])
+            assign_until_present(ctx, item.name, aid, new_id, item.tests_by_aid[aid],
+                                 'old agent was NOT deleted')
         for aid in aids:
             needed = set(item.tests_by_aid[aid])
 
