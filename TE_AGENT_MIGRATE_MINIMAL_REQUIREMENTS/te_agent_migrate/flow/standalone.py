@@ -40,6 +40,7 @@ STEP_UI_TOKEN = 'ui_set_target_token'
 STEP_TARGET_ONLINE = 'api_target_online'
 STEP_SHARE_BACK = 'api_share_back'
 STEP_ASSIGN_TESTS = 'api_assign_tests'
+ASSIGN_CHUNK_SIZE = 10
 STEP_REPOINT_A2A = 'repoint a2a targets'
 STEP_DELETE_OLD = 'api_delete_old'
 STEP_RENAME = 'api_rename'
@@ -376,7 +377,10 @@ def _assign_tests(ctx, item, new_id):
     detail = 'assigned %s to agent %s and verified' % (_assign_text(item), new_id)
     with ctx.step(item.name, STEP_ASSIGN_TESTS, detail, changed=True):
         for aid in aids:
-            ctx.api.assign_tests(aid, new_id, item.tests_by_aid[aid])
+            ids = list(item.tests_by_aid[aid])
+            # One call with 81 tests timed out at the customer (30 s limit). Small batches stay under it.
+            for start in range(0, len(ids), ASSIGN_CHUNK_SIZE):
+                ctx.api.assign_tests(aid, new_id, ids[start:start + ASSIGN_CHUNK_SIZE])
         for aid in aids:
             needed = set(item.tests_by_aid[aid])
 
