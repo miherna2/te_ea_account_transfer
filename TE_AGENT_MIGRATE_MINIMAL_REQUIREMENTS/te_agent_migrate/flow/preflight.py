@@ -66,10 +66,10 @@ changed, these are plain attributes, set on every item including blocked ones)
 ``owner_proven`` True when the owner proof rule passed.
 ``share_sources`` ``{'get_agent': [aid...], 'scan': [aid...]}`` for reports.
 ``owner_assumed`` True when the owner was NOT proven by the API but assumed by the operator
-                 (``--owner-is-source``); the dry-run file records ``assumed`` or ``proven``.
+                 (the operator confirms it in apply mode); the dry-run file records ``assumed`` or ``proven``.
 ``a2a_targets``  list of dict ``{'aid', 'test_id', 'old_target_agent_id'}``, see "Agent-to-agent tests".
 
-Agent-to-agent tests (``--repoint-agent-to-agent``, ``ctx.repoint_a2a``)
+Agent-to-agent tests (``ctx.repoint_a2a``, always on when run from the command line)
 ------------------------------------------------------------------------
 After a move the device gets a NEW agent id. An agent-to-agent test names its target by id
 (``targetAgentId``), so a test that targets the device would break.
@@ -81,21 +81,17 @@ After a move the device gets a NEW agent id. An agent-to-agent test names its ta
   ``targetAgentId`` becomes a BLOCKER (the repoint cannot be proven safe). A cluster that a2a tests target is a
   BLOCKER too ("a2a repoint is not supported for clusters").
 
-Target group rules (re-run guard, every device, with or without ``--owner-is-source``)
------------------------------------------------------------------------------------
-A device is blocked with "agent is already in the target group (re-run, or owned by the target)"
-when its id (cluster id for clusters) is listed in the target group, or when the target group is in
-its share set. A device that was legitimately shared with the target before the move is allowed when
-its inventory row lists the target group in ``share_aids``; without that it is blocked too.
+Target group rules
+------------------
+The target group may already SEE a device (shared before the move). That is not a block: the item gets
+``visible_in_target`` and a warning. A device whose id is in ``ctx.migrated_ids`` (new agents that this tool
+created in an earlier run) is ``skipped``, so a re-run never moves a device twice.
 
 Multi-target runs (inventory v3)
 --------------------------------
 Each inventory row may name its own target group (``target_aid``). The target of a row is the
 row value, else ``ctx.target_aid``. The source group is still one per run. Every item gets
-``target_aid``. An inventory row that lists its target in ``share_aids`` states that the device
-is shared with the target already (the share list comes from the live account group list of the
-device). For such a row the re-run guard above does not block when the owner is proven. A row
-without this statement keeps the guard.
+``target_aid``. The column ``share_aids`` is ignored: the groups that see a device are read from the API.
 
 Stale ids and moved devices
 ---------------------------
@@ -652,6 +648,7 @@ def _item(inv, status, reasons=None, record=None, owner_aid='', share_aids=None,
     item.owner_assumed = bool(owner_assumed)
     item.a2a_targets = [dict(t) for t in (a2a_targets or [])]
     item.share_sources = dict(share_sources or {'get_agent': [], 'scan': []})
+    item.visible_in_target = False  # set by the preflight when the target group already sees the device
     if status == STATUS_READY:
         for text in item.warnings:
             item.reasons.append('warning: ' + text)
@@ -705,8 +702,6 @@ def _lookup(inv, groups, source, target, source_records, run_warnings):
 def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner_source=False):
     source = str(ctx.source_aid)
     target = _inv_target(ctx, inv)
-    # the inventory row states that the device is shared with the target already
-    expected_in_target = bool(getattr(inv, 'target_aid', None)) and target in list(getattr(inv, 'share_aids', None) or [])
 
     if source == target:
         return _blocked(inv, ['source and target account group are the same (%s)' % source])
@@ -724,6 +719,10 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         return _blocked(inv, [problem], record=record, warnings=warnings)
 
     agent_id = str(record.agent_id)
+    if agent_id in set(str(i) for i in (getattr(ctx, 'migrated_ids', None) or ())):
+        reason = ('already migrated: agent id %s is the new agent that this tool created in an earlier run'
+                  % agent_id)
+        return _item(inv, STATUS_SKIPPED, reasons=[reason], record=record, warnings=warnings)
     if agent_id in seen_ids:
         return _blocked(
             inv,
@@ -776,34 +775,25 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         )
 
     # Re-run after a successful move (lab case L8). The new agent is owned by the target and shared back to
-    # the source, so the name and IP lookup above finds it in the source group, and an inventory row that
-    # lists the target in share_aids switches the guard below off. The inventory id is then the only
-    # sign: it names the OLD agent (gone), the live agent has another id and is already in the target.
-    if (expected_in_target and inv.agent_id and str(inv.agent_id).strip() != agent_id
-            and any(str(t.agent_id) == agent_id for t in target_agents)):
+    # the source, so the name and IP lookup above finds it in the source group. The inventory id (when the
+    # row has one) names the OLD agent (gone): the live agent has another id and is already in the target.
+    visible_in_target = any(str(t.agent_id) == agent_id for t in target_agents)
+    if inv.agent_id and str(inv.agent_id).strip() != agent_id and visible_in_target:
         reason = ('already migrated: inventory agent_id %s is gone, agent id %s with the same name and IP '
                   'is already in target group %s; refresh the inventory' % (inv.agent_id, agent_id, target))
         return _item(inv, STATUS_SKIPPED, reasons=[reason], record=record, warnings=warnings)
-
-    # the device is already listed in the target group: a re-run, or owned by the target
-    if not expected_in_target and any(str(t.agent_id) == agent_id for t in target_agents):
-        return _blocked(
-            inv, ['%s; %s' % (REASON_IN_TARGET, REASON_IN_TARGET_HINT)],
-            record=record, warnings=warnings, members=members,
-        )
 
     # owner proof and share set (GET /agents/{id} + scan of every reachable group)
     sharing = _sharing_check(ctx, record, groups, scan_aids, assume_owner_source)
     warnings.extend(sharing['warnings'])
     shared_to_target = (target in sharing['sources'].get('get_agent', [])
                         or target in sharing['share_aids'])
-    if shared_to_target and not expected_in_target:
-        return _blocked(
-            inv, list(sharing['blocked']) + ['%s; %s' % (REASON_IN_TARGET, REASON_IN_TARGET_HINT)],
-            record=record, warnings=warnings, members=members,
-            owner_proven=sharing['owner_proven'], share_sources=sharing['sources'],
-            owner_assumed=sharing['owner_assumed'],
-        )
+    # A device that the target group already sees is normal (it is shared with it). It is NOT a blocker:
+    # the operator confirms that the source group still owns it (a device that the target owns is not moved).
+    visible_in_target = visible_in_target or shared_to_target
+    if visible_in_target:
+        warnings.append('target group %s already sees this device (shared). It is moved only if the source '
+                        'group %s still owns it' % (target, source))
     if sharing['blocked']:
         return _blocked(
             inv, sharing['blocked'], record=record, warnings=warnings, members=members,
@@ -811,11 +801,6 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
             owner_assumed=sharing['owner_assumed'],
         )
     share_aids = sharing['share_aids']
-
-    unseen = [a for a in getattr(inv, 'share_aids', None) or [] if a not in share_aids and a != target]
-    if unseen:
-        warnings.append('inventory share_aids %s do not see the agent now; they will be added'
-                        % _aids_text(unseen))
 
     tests_by_aid = {}
     for aid in share_aids:
@@ -839,12 +824,14 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
 
     tags = _tags_for(groups, share_aids, agent_id, warnings)
 
-    return _item(
+    item = _item(
         inv, STATUS_READY, record=record, owner_aid=source, share_aids=share_aids,
         tests_by_aid=tests_by_aid, tags=tags, members=members, warnings=warnings,
         test_enabled=test_enabled, owner_proven=True, share_sources=sharing['sources'],
         owner_assumed=sharing['owner_assumed'], a2a_targets=a2a_targets,
     )
+    item.visible_in_target = bool(visible_in_target)
+    return item
 
 
 def _scan_groups(ctx, all_aids, inventory_agents=()):

@@ -10,6 +10,8 @@ LEGACY_COLUMNS = ['hostname', 'ip_address']
 V2_COLUMNS = ['type', 'name', 'ip_address']
 V2_COLUMNS_WITH_ID = ['type', 'name', 'ip_address', 'agent_id']
 # v3: the v2 columns, then these optional columns in this order (any subset).
+# ``share_aids`` is still accepted (old files) but IGNORED: the groups that see an agent are read from the
+# API and the new agent keeps them (plus the old source group and the target, which becomes the owner).
 V3_OPTIONAL_COLUMNS = ['agent_id', 'target_aid', 'share_aids']
 V3_COLUMNS = V2_COLUMNS + V3_OPTIONAL_COLUMNS
 # Kept for backwards compatibility with code importing the old constant.
@@ -105,10 +107,6 @@ def _parse_row(row, header, line_number):
     if target_aid is not None and not target_aid.isdigit():
         raise ConfigurationError(
             'Inventory line %d has invalid target_aid (digits only): %s' % (line_number, target_aid)
-        )
-    if target_aid is not None and share_aids and target_aid not in share_aids:
-        raise ConfigurationError(
-            'Inventory line %d: share_aids must contain target_aid %s' % (line_number, target_aid)
         )
     return InventoryAgent(
         hostname=name, ip_address=ip_address, kind=kind, agent_id=agent_id,

@@ -40,11 +40,15 @@ The steps, one device at a time:
 
 ## What you give it
 
-| Input | Example |
+| Input | Where |
 |---|---|
-| The device: **name and IP address** | `MyAgent-01`, `10.1.1.5` |
-| The source account group ID | `100` |
-| The destination account group ID | `200` |
+| The devices: **name and IP address**, and the destination group ID of each one | `work/input/inventory.csv` |
+| The ThousandEyes API v7 token | the tool asks (hidden) |
+| The source and destination account groups | the tool lists them, you pick |
+| The agent web UI login | the tool asks (hidden) |
+| The registration token of each destination group ("Account Group Token" in the ThousandEyes UI, under Add New Enterprise Agent) | the tool asks (hidden), once per destination group |
+
+There are no environment variables and no `.env` file to prepare. Secrets are never written to disk.
 
 The tool checks that the name and the IP address belong to the same agent in the source group.
 If they do not match, the device is blocked and nothing is touched. This protects you from moving
@@ -59,21 +63,14 @@ the wrong device.
                       anything else          ->  BLOCKED, nothing touched
 ```
 
-You also need these secrets. Never put them in a file you share.
-
-| Secret | Variable |
-|---|---|
-| ThousandEyes API v7 token | `TE_OAUTH_TOKEN` |
-| Agent web UI login | `TE_AGENT_UI_USERNAME`, `TE_AGENT_UI_PASSWORD` |
-| Registration token of the destination group (the "Account Group Token" in the ThousandEyes UI, under Add New Enterprise Agent) | `TE_TARGET_TOKEN_200` (use the destination group ID) |
-
-The source group ID goes in `TE_SOURCE_AID`.
-If a variable is missing, the tool asks for it with a hidden prompt.
+The groups that see the old agent keep seeing the new one. You do not list them: the tool reads them
+and shares the new agent with the same groups, the source group and the destination group. The
+destination group becomes the owner of the new agent.
 
 ## Setup (once)
 
 There is no virtual environment. The tool runs with the Python you already have. One command
-copies the three small libraries it needs (`requests`, `urllib3`, `python-dotenv`) into a `libs`
+copies the three small libraries it needs (`requests` and `urllib3`) into a `libs`
 folder inside the project. Nothing is installed into your Python and nothing needs activating.
 
 You need Python 3.6 or newer, built with OpenSSL 1.1.1 or newer (TLS 1.3).
@@ -81,9 +78,8 @@ Use a Python from python.org or Homebrew. Apple's `/usr/bin/python3` is too old.
 The computer that runs the tool must reach each agent on TCP 443 and `api.thousandeyes.com`.
 
 In the commands of this guide, macOS and Linux use `python3`. On Windows type `python`
-(or `py`) instead. On Windows use the **Command Prompt**: press the Windows key, type `cmd`, press
-Enter, then go to the project folder with `cd`. In `set NAME=value` do not put quotes around the value. If a password has the characters `& ^ % < >`,
-leave its variable out: the tool then asks for it with a hidden prompt.
+(or `py`) instead, in the **Command Prompt** (press the Windows key, type `cmd`, press Enter, then go to
+the project folder with `cd`).
 
 **macOS or Linux** (Terminal, in the project folder):
 
@@ -105,17 +101,14 @@ connection: use a newer Python. To remove the libraries later, delete the `libs`
 ## Migrate
 
 ```
-  [1 inventory]  ->  [2 dry run]  ->  clean?  --no-->  read the reason, fix, repeat step 2
+  [1 inventory]  ->  [2 preview]  ->  clean?  --no-->  read the reason, fix, repeat step 2
    (CSV file)        (no changes)       |
-                                       yes: dry-run-ok.json is written
-                                        |
+                                        yes
                                         v
                                    [3 apply]  ->  moves the devices, one at a time
 ```
 
 ### 1. Write the inventory
-
-Make the folder and copy the example.
 
 ```bash
 mkdir -p work/input                                    # macOS or Linux
@@ -130,126 +123,53 @@ copy examples\inventory.example.csv work\input\inventory.csv
 Edit `work/input/inventory.csv`. One line for each device:
 
 ```
-type,name,ip_address,agent_id,target_aid
-agent,MyAgent-01,10.1.1.5,,200
-agent,MyAgent-02,10.1.1.6,,200
+type,name,ip_address,target_aid
+agent,MyAgent-01,10.1.1.5,200
+agent,MyAgent-02,10.1.1.6,200
 ```
 
 - `name` and `ip_address` must be exactly those of the agent in the source group.
-- `target_aid` is the destination group ID. Each device can have a different one (see the examples).
-- Leave `agent_id` empty (or put the current agent ID).
+- `target_aid` is the destination group ID. Each device can have a different one.
 - Start with one device.
 
-**Column `share_aids`.** Usually you leave it out. Add it in one case: **the device is already
-shared with the destination group** (for example, tests of the destination group already run on it).
-Without `share_aids` the dry run blocks that device with "agent is already in the target group",
-to protect you from moving a device that has already been moved. Put the destination group in the
-row to confirm that the sharing is intended:
-
-```
-type,name,ip_address,agent_id,target_aid,share_aids
-agent,MyAgent-01,10.1.1.5,1234567,200,200;100
-```
-
-- `share_aids` is a list of group IDs separated by `;`. It must contain `target_aid`.
-- Put the current `agent_id` in the row when you use `share_aids`.
-- The new agent is always shared with: the destination group, every group that sees the agent now
-  (including the source group) and every group that holds tests of the agent. `share_aids` only adds
-  to that list, it never removes a group.
-
-### 2. Dry run (nothing changes)
-
-**macOS or Linux:**
+### 2. Preview (nothing changes)
 
 ```bash
-export TE_SOURCE_AID=100
-export TE_OAUTH_TOKEN=...
-export TE_AGENT_UI_USERNAME=admin
-export TE_AGENT_UI_PASSWORD=...
-export TE_TARGET_TOKEN_200=...
-
-python3 -m te_agent_migrate --owner-is-source \
-  --inventory work/input/inventory.csv --output work/runs/w1
+python3 -m te_agent_migrate        # Windows: python -m te_agent_migrate
 ```
 
-**Windows (Command Prompt):**
-
-```bat
-set TE_SOURCE_AID=100
-set TE_OAUTH_TOKEN=...
-set TE_AGENT_UI_USERNAME=admin
-set TE_AGENT_UI_PASSWORD=...
-set TE_TARGET_TOKEN_200=...
-
-python -m te_agent_migrate --owner-is-source ^
-  --inventory work\input\inventory.csv --output work\runs\w1
-```
-
-A clean dry run writes `work/runs/w1/dry-run-ok.json`.
-If a device is blocked, the output gives the reason (see "If the dry run says" below). Fix it and run again.
+The tool asks for what it needs, checks every device and prints the plan. It writes the report to
+`work/dry-run`. Each preview replaces the previous one. If a device is blocked, the output gives the
+reason (see "If the preview says" below). Fix it and run again.
 
 ### 3. Apply (moves the devices)
 
-The tool asks `y` or `n`, then moves the devices one at a time.
-
-**macOS or Linux:**
-
 ```bash
-python3 -m te_agent_migrate --owner-is-source --apply \
-  --inventory work/input/inventory.csv --output work/runs/w1 \
-  --confirmed-dry-run-file work/runs/w1/dry-run-ok.json
+python3 -m te_agent_migrate --apply
 ```
 
-**Windows (Command Prompt):**
+The tool finds the last preview by itself. If the inventory or the account groups changed since then,
+it says so, shows the new plan and asks again. It also asks you to confirm that the source group is the
+owner of the devices (see below), then `y` or `n`, then moves the devices one at a time.
 
-```bat
-python -m te_agent_migrate --owner-is-source --apply ^
-  --inventory work\input\inventory.csv --output work\runs\w1 ^
-  --confirmed-dry-run-file work\runs\w1\dry-run-ok.json
-```
-
-Do not edit the inventory between the dry run and the apply.
-`dry-run-ok.json` works once and only for the same inventory, groups and flags.
 **Apply resets the real agent. A reset cannot be undone.** Do not press Ctrl-C during a device.
+The tool stops at the first failure and prints the state of that device. It never changes an offline
+device. Before each device it saves a snapshot, and the reports of an apply are in `work/apply/<date-time>`.
+A device that was moved is remembered (`work/state/migrated.json`), so running the tool again skips it.
 
-The tool stops at the first failure and prints the state of that device.
-It never changes an offline device. Before each device it saves a snapshot in the output folder.
+## The options
 
-## The flags
+| Option | What it does |
+|---|---|
+| `--apply` | Really moves the devices. Without it nothing changes |
+| `--inventory FILE` | Another inventory file. Default: `work/input/inventory.csv` |
+| `--timeout SECONDS` | How long to wait for each step, only if a step times out on a slow network |
+| `-v` | More output |
 
-Use the same flags in the dry run and in the apply, except `--apply` and `--confirmed-dry-run-file`.
+Older options (`--dry-run`, `--owner-is-source`, `--repoint-agent-to-agent`, `--auto-reenable-tests`)
+are still accepted and do nothing: the tool does it by itself.
 
-| Flag | What it does | When to use it |
-|---|---|---|
-| `--inventory FILE` | The CSV with the devices | Always. Default: `work/input/inventory.csv` |
-| `--output FOLDER` | Folder for the reports, the snapshots and `dry-run-ok.json` | Always. Default: `work/runs`. Use a new folder for each wave |
-| `--owner-is-source` | You confirm that the **source** group owns the devices | When the source group owns every device in the inventory (see below) |
-| `--repoint-agent-to-agent` | Points the tests that use a device as their target agent to the new agent | Only when the dry run reports agent-to-agent tests on a device (see below) |
-| `--apply` | Really moves the devices | Only in step 3 |
-| `--confirmed-dry-run-file FILE` | The `dry-run-ok.json` of a clean dry run of the same inventory | Only with `--apply` |
-| `--timeout SECONDS` | How long to wait for each step | Only if a step times out on a slow network |
-| `-v` | More output | When you look for a problem |
-
-### Which flags do I need?
-
-```
- Do you own the devices in the source group (you registered them there)?
-   |
-   +-- yes --> add  --owner-is-source           (dry run and apply)
-   |
-   +-- no / not sure --> do not move them: see "--owner-is-source" below
-
- Does the dry run say "agent-to-agent test(s) use this device as target agent"?
-   |
-   +-- yes --> add  --repoint-agent-to-agent    (dry run and apply)
-   |
-   +-- no  --> nothing to add
-
- Typical first run:   python3 -m te_agent_migrate --owner-is-source ...
- Typical apply:       same flags  +  --apply  +  --confirmed-dry-run-file ...
-```
-
-### `--owner-is-source`: who owns the agent?
+### Who owns the agent?
 
 An agent that you see in the source group is either **owned** by that group or only **shared** with it.
 The ThousandEyes API does not tell which. This matters because the move deletes the old agent:
@@ -267,82 +187,46 @@ The ThousandEyes API does not tell which. This matters because the move deletes 
 
    Move A to group 200:                            Move A to group 200:
    100 gives the agent away. This is               group 500 LOSES its agent.
-   what you want.      -> use the flag             -> do NOT use the flag, take the
-                                                      device out of the inventory
+   what you want.      -> answer y                 -> answer n, take the device out
+                                                      of the inventory
 ```
 
-Without `--owner-is-source` the tool blocks every device with "owner not proven", so a mistake
-cannot silently take an agent from another group. The flag is your statement that the source group
-is the owner of **all** devices in the inventory. If the inventory mixes owned and shared devices,
-put only the owned ones in it.
+In `--apply` the tool lists the devices and asks "Is the source group the owner of ALL these devices?".
+A device that was registered with the source group's own Account Group Token is owned by the source group.
+If you are not sure, ask the team that installed the agent before you move it.
 
-How to know: an agent that was registered with the source group's own Account Group Token is owned
-by the source group. If you are not sure, ask the team that installed the agent before you move it.
-
-### `--repoint-agent-to-agent`: tests that point at the agent
+### Tests that point at the agent
 
 Most tests only run **from** an agent, so they keep working after the move. An agent-to-agent test
-also uses an agent as its **target**. The new agent has a new ID, so those tests would point at the
-deleted agent. The flag makes the tool change their target to the new agent.
-
-```
- agent-to-agent test T9 (group 100):   from agent X   --->   target agent A (the device)
-
- Without the flag the dry run is BLOCKED:
-   "1 agent-to-agent test(s) use this device as target agent"
-
- With the flag, apply does this:
-   T9:  from agent X ---> target A (old)        becomes        from agent X ---> target B (new)
-```
-
-Use it only when the dry run reports this message. Put it in the dry run **and** in the apply.
+also uses an agent as its **target**. The new agent has a new ID, so the tool changes the target of those
+tests to the new agent, by itself. The preview tells you how many there are.
 
 ## Examples
 
-**One device, source 100 to destination 200 (the usual case):**
+**Several devices to different destinations (one registration token per destination):**
 
 ```
-type,name,ip_address,agent_id,target_aid
-agent,MyAgent-01,10.1.1.5,,200
-```
-```
-python3 -m te_agent_migrate --owner-is-source --inventory work/input/inventory.csv --output work/runs/w1
-```
-
-**Several devices to different destinations (one token per destination):**
-
-```
-type,name,ip_address,agent_id,target_aid
-agent,MyAgent-01,10.1.1.5,,200
-agent,MyAgent-02,10.1.1.6,,200
-agent,MyAgent-03,10.1.1.7,,250
-```
-```
- 100 (source) --+--> MyAgent-01, MyAgent-02 --> 200     needs TE_TARGET_TOKEN_200
-                +--> MyAgent-03             --> 250     needs TE_TARGET_TOKEN_250
+type,name,ip_address,target_aid
+agent,MyAgent-01,10.1.1.5,200
+agent,MyAgent-02,10.1.1.6,200
+agent,MyAgent-03,10.1.1.7,250
 ```
 
-**The dry run reports agent-to-agent tests:** run both steps again with the extra flag.
-
 ```
-python3 -m te_agent_migrate --owner-is-source --repoint-agent-to-agent \
-  --inventory work/input/inventory.csv --output work/runs/w1
-python3 -m te_agent_migrate --owner-is-source --repoint-agent-to-agent --apply \
-  --inventory work/input/inventory.csv --output work/runs/w1 \
-  --confirmed-dry-run-file work/runs/w1/dry-run-ok.json
+ 100 (source) --+--> MyAgent-01, MyAgent-02 --> 200
+                +--> MyAgent-03             --> 250
 ```
 
-## If the dry run says
+## If the preview says
 
 | Message | What to do |
 |---|---|
-| owner group not proven to be the source group | Add `--owner-is-source`, only if the source group owns the devices |
 | No agent matches IP and name | Check the name and the IP address in the inventory |
-| N agent-to-agent test(s) use this device as target agent | Add `--repoint-agent-to-agent` to the dry run and to the apply |
-| agent is already in the target group | The device is shared with the destination group already. Add `share_aids` to its inventory row (see step 1). If it was moved before, remove it from the inventory |
+| owner group not proven to be the source group | Normal. In `--apply` you confirm the owner |
+| the target group already sees this device | Only a warning: the device was shared with the destination group before. It is moved if the source group owns it |
 | Already migrated (skipped) | The device is in the destination group already |
-| UI login failed | Check `TE_AGENT_UI_USERNAME` and `TE_AGENT_UI_PASSWORD` |
-| Dry-run confirmation is stale | The inventory changed after the dry run. Run the dry run again |
+| UI login failed | Check the agent UI user and password |
+| no usable earlier preview / the situation changed since the last preview | Only information: the tool shows the new plan and asks you again |
 
 ## After the move
 
@@ -363,5 +247,4 @@ te_agent_migrate/   the migration tool
 te_report/          the optional impact report
 tools/              te_discovery.sh (optional)
 examples/           example input files
-.env.example        the variables (you can use a .env file instead)
 ```

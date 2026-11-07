@@ -110,11 +110,11 @@ def _test_aids(item):
 def _desired_groups(item, target_aid):
     """Full share list, never empty when a target is set.
 
-    Order: the target, the inventory share list (column order), every group that sees the agent
-    now (sorted), every group that holds tests. Duplicates are dropped.
+    Order: the target (it becomes the owner), every group that sees the agent now (sorted; this
+    includes the old source group), every group that holds tests. Duplicates are dropped. Nothing
+    comes from the inventory: the operator never lists the groups.
     """
     wanted = [str(target_aid)] if target_aid not in (None, '') else []
-    wanted.extend(str(a) for a in (getattr(getattr(item, 'inventory', None), 'share_aids', None) or []))
     wanted.extend(sorted((str(a) for a in item.share_aids), key=_aid_key))
     wanted.extend(_test_aids(item))
     return _unique(wanted)

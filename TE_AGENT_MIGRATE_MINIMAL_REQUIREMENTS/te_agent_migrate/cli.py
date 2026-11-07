@@ -4,12 +4,11 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 from te_agent_migrate.api_client import ThousandEyesApiClient
 from te_agent_migrate.errors import ConfigurationError, MigrationError
@@ -36,6 +35,13 @@ DRY_RUN_SCHEMA = 5
 UI_USERNAME_ENV = "TE_AGENT_UI_USERNAME"
 UI_PASSWORD_ENV = "TE_AGENT_UI_PASSWORD"
 DRY_RUN_OK_FILENAME = "dry-run-ok.json"
+# Fixed places under the project folder (never relative to the folder the operator stands in).
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+WORK_DIR = PROJECT_DIR / "work"
+DEFAULT_INVENTORY = WORK_DIR / "input" / "inventory.csv"
+DRY_RUN_DIR = WORK_DIR / "dry-run"      # the latest preview only: it is emptied at the start of each preview
+APPLY_ROOT = WORK_DIR / "apply"         # one timestamped folder per apply: snapshots and logs are evidence
+MIGRATED_FILE = WORK_DIR / "state" / "migrated.json"
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_REFUSED = 2
@@ -71,69 +77,59 @@ def build_parser():
         description=(
             "Move ThousandEyes Enterprise Agents to other account groups. Only the agent moves: "
             "its tests stay in their account group, and the agent is shared back and gets the "
-            "same tests. Dry run is the default."
-        ),
-    )
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Preview only. This is the default.")
-    mode.add_argument("--apply", action="store_true", help="Move the devices. Needs --confirmed-dry-run-file.")
-    parser.add_argument(
-        "--inventory",
-        default="work/input/inventory.csv",
-        help=(
-            "Inventory CSV (default work/input/inventory.csv). Columns: "
-            "type,name,ip_address[,agent_id][,target_aid][,share_aids]. The last three are "
-            "optional, in this order. target_aid is the destination group of that device."
+            "same tests. Without --apply you only get a preview: nothing changes."
         ),
     )
     parser.add_argument(
-        "--owner-is-source",
-        dest="owner_is_source",
-        action="store_true",
-        help=(
-            "Confirm that the SOURCE account group owns the devices in the inventory. "
-            "The ThousandEyes API does not say which group owns an agent, so the tool cannot "
-            "check this itself and blocks every device unless you give this flag. Use it only "
-            "when the source group really owns them."
-        ),
+        "--apply", action="store_true",
+        help="Move the devices. The tool shows the plan and asks you to confirm before it changes anything.",
     )
     parser.add_argument(
-        "--auto-reenable-tests",
-        dest="auto_reenable_tests",
-        action="store_true",
-        help=argparse.SUPPRESS,  # clusters only
+        "--inventory", default=None,
+        help=("CSV with the devices: type,name,ip_address,target_aid (target_aid is the destination group "
+              "id of each device). Default: work/input/inventory.csv."),
     )
     parser.add_argument(
-        "--repoint-agent-to-agent",
-        dest="repoint_agent_to_agent",
-        action="store_true",
-        help=(
-            "Use it when other tests (agent-to-agent tests) use a device as their target agent. "
-            "After a move the device has a new agent ID, so those tests must point to it. "
-            "Without this flag the dry run blocks such devices and names the tests. With it, the "
-            "tool changes only the target agent of those tests, after the new agent is online and "
-            "has its tests and before the old agent is deleted. Give it in the dry run AND in "
-            "the apply."
-        ),
-    )
-    parser.add_argument(
-        "--confirmed-dry-run-file",
-        dest="confirmed_dry_run_file",
-        metavar="PATH",
-        help=(
-            "Needed with --apply. The dry-run-ok.json file that a clean dry run of the same "
-            "inventory wrote into its --output folder. It works once."
-        ),
-    )
-    parser.add_argument(
-        "--timeout",
-        type=_positive_integer,
-        default=None,
+        "--timeout", type=_positive_integer, default=None,
         help="Wait limit in seconds for each wait step (optional).",
     )
-    parser.add_argument("--output", default="work/runs", help="Folder for reports, snapshots and the dry-run file.")
     parser.add_argument("-v", "--verbose", action="store_true", help="More output.")
+    # Old options. They are still accepted so that old instructions do not fail, but they do nothing now.
+    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--owner-is-source", dest="owner_is_source", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--repoint-agent-to-agent", dest="repoint_agent_to_agent", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--auto-reenable-tests", dest="auto_reenable_tests", action="store_true",
+                        help=argparse.SUPPRESS)
+    # Lab and tests only: another folder for the reports, another place for the preview file.
+    parser.add_argument("--output", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--confirmed-dry-run-file", dest="confirmed_dry_run_file", default=None,
+                        help=argparse.SUPPRESS)
     return parser
+
+
+def _old_option_notes(args):
+    """One line for each old option that was given: it is not needed any more."""
+    notes = []
+    if getattr(args, "dry_run", False):
+        notes.append("--dry-run is not needed: without --apply you always get a preview")
+    if getattr(args, "owner_is_source", False):
+        notes.append("--owner-is-source is not needed: --apply asks you to confirm the owner")
+    if getattr(args, "repoint_agent_to_agent", False):
+        notes.append("--repoint-agent-to-agent is not needed: agent-to-agent tests are repointed automatically")
+    return notes
+
+
+def _empty_dir(path):
+    """Remove the content of the preview folder. Only the fixed DRY_RUN_DIR is ever emptied."""
+    if Path(path) != DRY_RUN_DIR:
+        raise ConfigurationError("refusing to empty %s" % path)
+    if DRY_RUN_DIR.exists():
+        shutil.rmtree(str(DRY_RUN_DIR), ignore_errors=True)
+
+
+def _apply_stamp():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def _resolve_agent_ui_inputs(report, prompter, console):
@@ -452,20 +448,14 @@ def _dry_run_binding(items, owner_is_source, default_target_aid=None, repoint_a2
     }
 
 
-def _compare_dry_run_binding(data, items, owner_is_source, default_target_aid=None, repoint_a2a=False):
-    """Refuse (PreconditionRefused) when the fresh preflight differs from the dry run."""
+def _dry_run_problems(data, items, owner_is_source, default_target_aid=None, repoint_a2a=False):
+    """List what differs between the saved preview and the fresh preflight (empty list = same)."""
     schema = data.get("schema_version")
     if not isinstance(schema, int) or isinstance(schema, bool) or schema < DRY_RUN_SCHEMA:
-        raise PreconditionRefused(
-            "Dry-run confirmation has an old file format (schema %s, schema %s is needed): "
-            "run --dry-run again. Nothing was changed." % (schema, DRY_RUN_SCHEMA)
-        )
+        return ["the preview file has an old file format (schema %s, schema %s is needed)" % (schema, DRY_RUN_SCHEMA)]
     expected = data.get("ready")
     if not isinstance(expected, list) or "excluded_ids" not in data or "owner_is_source" not in data:
-        raise PreconditionRefused(
-            "Dry-run confirmation has no device binding (old file format). "
-            "Run --dry-run again. Nothing was changed."
-        )
+        return ["the preview file has no device binding (old format)"]
     now = _dry_run_binding(items, owner_is_source, default_target_aid, repoint_a2a)
     problems = []
     if bool(data.get("repoint_a2a")) != now["repoint_a2a"]:
@@ -528,13 +518,19 @@ def _compare_dry_run_binding(data, items, owner_is_source, default_target_aid=No
         problems.append("the set of excluded (offline) devices changed")
     if sorted(str(i) for i in data.get("skipped_ids") or []) != now["skipped_ids"]:
         problems.append("the set of skipped (already migrated) devices changed")
+    return problems
+
+
+def _compare_dry_run_binding(data, items, owner_is_source, default_target_aid=None, repoint_a2a=False):
+    """Refuse (PreconditionRefused) when the fresh preflight differs from the dry run."""
+    problems = _dry_run_problems(data, items, owner_is_source, default_target_aid, repoint_a2a)
     if problems:
         shown = "; ".join(problems[:8])
         if len(problems) > 8:
             shown += "; ... (+%d more)" % (len(problems) - 8)
         raise PreconditionRefused(
             "Dry-run confirmation does not match the current state: %s. "
-            "Run --dry-run again. Nothing was changed." % shown
+            "Run the preview again. Nothing was changed." % shown
         )
 
 
@@ -608,9 +604,84 @@ def _check_inventory_targets(agents, groups):
         )
 
 
+def _confirm_owner(console, prompter, report, source, items):
+    """Ask the operator to confirm that the source group owns the devices whose owner the API did not name.
+
+    The API does not tell which group owns an agent. The move deletes the old agent, so a device that the
+    source group only SEES (another group owns it) must not be moved: that group would lose its agent.
+    """
+    assumed = [item for item in items if item.status == "ready" and getattr(item, "owner_assumed", False)]
+    if not assumed:
+        return True
+    label = "%s [%s]" % (source.name, source.aid)
+    console.info("owner", "The source group %s gives away these %d device(s):" % (label, len(assumed)))
+    for item in assumed:
+        note = "   (the target group already sees it)" if getattr(item, "visible_in_target", False) else ""
+        console.info("owner", "  - %s%s" % (item.name, note))
+    console.info(
+        "owner",
+        "That is right ONLY if %s is the Primary Account Group (the owner) of every device above. "
+        "If another group owns one, remove it from the inventory: that group would lose its agent." % label,
+    )
+    console.info(
+        "owner",
+        "Check in ThousandEyes: Cloud & Enterprise Agents > the agent > Basic Configuration > Primary Account Group.",
+    )
+    answer = prompter.required_choice("Is %s the owner of ALL these devices?" % label, ("y", "n")) == "y"
+    report.record_decision("Source group owns the devices", "yes" if answer else "no")
+    return answer
+
+
+def _load_migrated_ids(console):
+    """Ids of the new agents that this tool created in earlier runs (so a re-run skips them)."""
+    try:
+        data = json.loads(MIGRATED_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    entries = data.get("agents") if isinstance(data, dict) else None
+    ids = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and entry.get("new_id"):
+            ids.add(str(entry["new_id"]))
+    return ids
+
+
+def _remember_migrated(console, results):
+    """Record the new agent ids of the devices that moved. A failure here is only a note."""
+    new = []
+    for result in results:
+        new_id = getattr(result, "new_agent_id", None) or getattr(result, "new_cluster_id", None)
+        if getattr(result, "ok", False) and new_id:
+            new.append({"name": result.name, "new_id": str(new_id), "time": _utc_now_text()})
+    if not new:
+        return
+    try:
+        MIGRATED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            data = json.loads(MIGRATED_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        agents = data.get("agents") if isinstance(data, dict) and isinstance(data.get("agents"), list) else []
+        known = set(str(e.get("new_id")) for e in agents if isinstance(e, dict))
+        agents.extend(e for e in new if e["new_id"] not in known)
+        _write_private_text(MIGRATED_FILE, json.dumps({"agents": agents}, indent=2) + "\n")
+    except OSError as exc:
+        console.info("run", "could not save %s (%s); a re-run may ask about these devices again"
+                     % (MIGRATED_FILE, exc.__class__.__name__))
+
+
+def _find_preview(path, inventory_path, console):
+    """The saved preview that matches this inventory, or None (then --apply makes and shows its own)."""
+    try:
+        return _load_dry_run_confirmation(str(path), inventory_path)
+    except PreconditionRefused as exc:
+        console.info("gate", "no usable earlier preview (%s)" % str(exc).replace(" Nothing was changed.", ""))
+        return None
+
+
 def _run_migration(
     args, api, groups, source, target, selected_mode, agents, console, report, prompter,
-    output, inventory_path, get_ui_credentials, dry_run_data=None,
+    output, inventory_path, get_ui_credentials, dry_run_data=None, gate_path=None,
 ):
     apply_mode = selected_mode is Mode.APPLY
     snapshot_dir = Path(output) / "snapshots"
@@ -638,17 +709,18 @@ def _run_migration(
         kwargs["timeout_seconds"] = args.timeout
     auto_reenable = bool(getattr(args, "auto_reenable_tests", False))
     kwargs["auto_reenable_tests"] = auto_reenable
-    repoint_a2a = bool(getattr(args, "repoint_agent_to_agent", False))
-    if repoint_a2a:  # passed only when set: an older FlowContext without the parameter still works
-        kwargs["repoint_a2a"] = True
-    report.record_decision(
-        "Repoint agent-to-agent tests",
-        "enabled" if repoint_a2a else "disabled (devices that a2a tests target are blocked)",
-    )
+    # Agent-to-agent tests that use a device as their target are always repointed to the new agent. The
+    # plan lists them before the operator confirms. A test that cannot be proven safe still blocks the device.
+    repoint_a2a = True
+    kwargs["repoint_a2a"] = True
+    report.record_decision("Repoint agent-to-agent tests", "automatic")
     report.record_decision(
         "Auto re-enable tests", "enabled" if auto_reenable else "disabled (manual list)"
     )
-    owner_is_source = bool(getattr(args, "owner_is_source", False))
+    # The API does not name the owner of an agent. The preview assumes the source group owns the devices
+    # (a field that names another group still blocks) and --apply asks the operator to confirm it.
+    owner_is_source = True
+    migrated_ids = _load_migrated_ids(console)
     all_aids = [group.aid for group in groups]
     if apply_mode:
         # Show a fresh, read-only preflight BEFORE the operator is asked to confirm.
@@ -656,6 +728,7 @@ def _run_migration(
         pre_kwargs = dict(kwargs, apply=False, target_account_token="")
         pre_ctx = _build_flow_context(pre_kwargs, str(snapshot_dir))
         pre_ctx.target_names = dict(target_names)
+        pre_ctx.migrated_ids = set(migrated_ids)
         console.play("Preflight before confirmation", Mode.DRY_RUN)
         pre_items = run_preflight(
             ctx=pre_ctx,
@@ -670,14 +743,21 @@ def _run_migration(
             "ready=%s blocked=%s excluded=%s skipped=%s"
             % (summary["ready"], summary["blocked"], summary["excluded"], summary.get("skipped", 0)),
         )
-        # The dry run is bound to the ready devices and their shares. Any difference refuses (exit 2).
+        # The fresh preview above is the plan. When an earlier preview exists, say what changed since then.
         if dry_run_data is None:
-            raise PreconditionRefused(
-                "--apply has no dry-run confirmation data. Run --dry-run first. "
-                "Nothing was changed."
-            )
-        _compare_dry_run_binding(dry_run_data, pre_items, owner_is_source, default_target_aid, repoint_a2a)
-        report.record_decision("Apply", "dry-run binding matches the fresh preflight")
+            console.info("gate", "no earlier preview matches; the fresh preview above is the plan. Read it "
+                                 "before you confirm")
+            report.record_decision("Apply", "no earlier preview; fresh preflight shown")
+        else:
+            differences = _dry_run_problems(dry_run_data, pre_items, owner_is_source, default_target_aid,
+                                            repoint_a2a)
+            if differences:
+                console.info("gate", "WARNING: the situation changed since the last preview: %s"
+                             % "; ".join(differences[:8]))
+                report.record_decision("Apply", "changed since the preview: %s" % "; ".join(differences[:8]))
+                dry_run_data = None  # the preview is not the plan; keep the file untouched
+            else:
+                report.record_decision("Apply", "same as the last preview")
         if preflight_has_blockers(pre_items):
             report.record_decision("Apply", "preflight blocked")
             console.info("run", "preflight has blockers; nothing was changed")
@@ -692,16 +772,22 @@ def _run_migration(
         tokens = TargetTokens(report, prompter, console, labels=target_labels).collect(needed)
         target_token = tokens.get(target.aid, "")
         kwargs["target_account_token"] = target_token
+        if not _confirm_owner(console, prompter, report, source, pre_items):
+            console.info("run", "owner not confirmed; nothing was changed")
+            report.write_final()
+            return EXIT_FAILED
         if not prompter.confirm_destructive():
             report.record_decision("Apply", "operator declined")
             console.info("run", "operator declined; nothing was changed")
             report.write_final()
             return EXIT_FAILED
         report.record_decision("Apply", "operator confirmed")
-        # Single use: no flow starts unless the dry-run file is marked as used.
-        _consume_dry_run_file(args.confirmed_dry_run_file)
-        console.info("gate", "dry-run confirmation marked as used (%s.used)" % args.confirmed_dry_run_file)
+        # Single use: the preview file that matched is marked as used before the first device is changed.
+        if dry_run_data is not None and gate_path:
+            _consume_dry_run_file(gate_path)
+            console.info("gate", "preview marked as used (%s.used)" % gate_path)
     ctx = _build_flow_context(kwargs, str(snapshot_dir))
+    ctx.migrated_ids = set(migrated_ids)
     ctx.target_tokens = dict(tokens)
     ctx.target_names = dict(target_names)
     all_target_aids = _all_target_aids(agents, target)
@@ -738,6 +824,8 @@ def _run_migration(
         raise
     code = _exit_code(console, results)
     clean = code == EXIT_OK
+    if apply_mode:
+        _remember_migrated(console, results)
     confirmation = None
     nothing_ready = False
     if not apply_mode:
@@ -759,7 +847,7 @@ def _run_migration(
     if confirmation is not None:
         console.info(
             "run",
-            "clean dry run; apply needs --confirmed-dry-run-file %s" % confirmation,
+            "clean preview (%s). To move the devices run the same command with --apply" % confirmation,
         )
     elif nothing_ready:
         console.info(
@@ -782,14 +870,25 @@ def main(argv=None):
 
 
 def _main(argv=None):
-    load_dotenv()
     args = build_parser().parse_args(argv)
     selected_mode = Mode.APPLY if args.apply else Mode.DRY_RUN
-    inventory = Path(args.inventory)
-    output = Path(args.output)
+    inventory = Path(args.inventory) if args.inventory else DEFAULT_INVENTORY
+    if args.output:  # lab and tests: one folder chosen by the caller, kept as it is
+        output = Path(args.output)
+    elif selected_mode is Mode.APPLY:
+        output = APPLY_ROOT / _apply_stamp()
+    else:
+        output = DRY_RUN_DIR
+        _empty_dir(output)  # only the latest preview is kept
+    # The preview that --apply looks for: the one in its own folder, or the file the caller named.
+    gate_path = Path(args.confirmed_dry_run_file) if args.confirmed_dry_run_file else (
+        (Path(args.output) if args.output else DRY_RUN_DIR) / DRY_RUN_OK_FILENAME
+    )
     console = MigrationConsole(verbose=args.verbose)
     console.banner()
     console.info("startup", "mode=%s; report output=%s" % (selected_mode.value, output))
+    for note in _old_option_notes(args):
+        console.info("startup", note)
     report = RunReport(output, selected_mode.value, {"inventory": str(inventory)})
     prompter = OperatorPrompter(report.append_decision)
     try:
@@ -807,13 +906,9 @@ def _main(argv=None):
         apply_mode = selected_mode is Mode.APPLY
         dry_run_data = None
         if apply_mode:
-            dry_run_data = _load_dry_run_confirmation(args.confirmed_dry_run_file, inventory)
-            console.info(
-                "gate",
-                "dry-run confirmation accepted (created %s)" % dry_run_data.get("created_utc", "?"),
-            )
-        elif args.confirmed_dry_run_file:
-            console.info("gate", "--confirmed-dry-run-file is only used with --apply; ignored")
+            dry_run_data = _find_preview(gate_path, inventory, console)
+            if dry_run_data is not None:
+                console.info("gate", "earlier preview found (created %s)" % dry_run_data.get("created_utc", "?"))
         if not apply_mode:
             # The agent UI credentials are asked only if a flow really opens the UI.
             get_ui_credentials = _lazy(lambda: _resolve_agent_ui_inputs(report, prompter, console))
@@ -853,7 +948,12 @@ def _main(argv=None):
                     % source.aid
                 )
             if dry_run_data is not None:
-                _check_dry_run_groups(dry_run_data, source, all_target_aids)
+                try:
+                    _check_dry_run_groups(dry_run_data, source, all_target_aids)
+                except PreconditionRefused as exc:
+                    console.info("gate", "the earlier preview is for other groups; it is not used (%s)"
+                                 % str(exc).split(". ")[0])
+                    dry_run_data = None
             if needs_target:
                 console.info(
                     "configuration",
@@ -883,7 +983,7 @@ def _main(argv=None):
             code = _run_migration(
                 args, api, groups, source, target, selected_mode, agents, console,
                 report, prompter, output, inventory, get_ui_credentials,
-                dry_run_data=dry_run_data,
+                dry_run_data=dry_run_data, gate_path=gate_path,
             )
             print("JSON report: %s" % report.json_path)
             print("CSV reports: %s" % report.csv_dir)
