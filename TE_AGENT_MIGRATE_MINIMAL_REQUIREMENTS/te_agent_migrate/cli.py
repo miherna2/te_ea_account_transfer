@@ -94,8 +94,9 @@ def build_parser():
     )
     parser.add_argument(
         "--inventory", default=None,
-        help=("CSV with the devices: type,name,ip_address,target_aid (target_aid is the destination group "
-              "id of each device). Default: work/input/inventory.csv."),
+        help=("CSV with the devices: name,ip_address and, optionally, target (destination group id or "
+              "name) and type. Default: work/input/inventory.csv. If the file does not exist the tool "
+              "asks you to type the devices."),
     )
     parser.add_argument(
         "--timeout", type=_positive_integer, default=None,
