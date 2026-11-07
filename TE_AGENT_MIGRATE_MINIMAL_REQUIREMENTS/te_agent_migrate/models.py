@@ -70,6 +70,10 @@ class InventoryAgent(_Record):
     """
 
     _field_names = ("hostname", "ip_address", "kind", "agent_id", "target_aid", "share_aids")
+    # Not part of the saved record. ``auto_kind``: the type was not written in the inventory, so preflight may
+    # correct it (agent or cluster). ``target_name``: the row names its destination group, not its id.
+    auto_kind = False
+    target_name = None
 
     def __init__(self, hostname, ip_address, kind="agent", agent_id=None, target_aid=None, share_aids=None):
         self.hostname = hostname

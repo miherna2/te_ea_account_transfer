@@ -1,4 +1,4 @@
-type,name,ip_address,target_aid
-agent,AAAA - HOST01,192.0.2.11,100
-agent,AAAA - HOST02,192.0.2.12,100
-agent,BBBB - HOST03,192.0.2.13,200
+name,ip_address,target
+AAAA - HOST01,192.0.2.11,100
+AAAA - HOST02,192.0.2.12,100
+BBBB - HOST03,192.0.2.13,Div_B

@@ -54,6 +54,18 @@ class OperatorPrompter(object):
             else:
                 print("Error: choose one of: %s." % suffix, file=sys.stderr)
 
+    def ask_yes(self, prompt):
+        """Yes/no with yes as the default (Enter). For questions that change nothing."""
+        while True:
+            answer = self._input("%s [Y/n]: " % prompt).strip().lower()
+            if answer in ("", "y", "yes"):
+                self._audit(prompt, "yes")
+                return True
+            if answer in ("n", "no"):
+                self._audit(prompt, "no")
+                return False
+            print("Error: type y or n (Enter means yes).", file=sys.stderr)
+
     def choose_account_group(self, prompt, groups):
         if not groups:
             raise ConfigurationError("The OAuth token cannot access any account groups")

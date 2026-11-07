@@ -42,13 +42,15 @@ The steps, one device at a time:
 
 | Input | Where |
 |---|---|
-| The devices: **name and IP address**, and the destination group ID of each one | `work/input/inventory.csv` |
-| The ThousandEyes API v7 token | the tool asks (hidden) |
-| The source and destination account groups | the tool lists them, you pick |
-| The agent web UI login | the tool asks (hidden) |
-| The registration token of each destination group ("Account Group Token" in the ThousandEyes UI, under Add New Enterprise Agent) | the tool asks (hidden), once per destination group |
+| The devices: **name and IP address** (and, if you want, the destination group of each one) | `work/input/inventory.csv`, or type them when the tool asks |
+| The ThousandEyes API v7 token | the tool asks (hidden) and checks it at once |
+| The source account group | the tool finds it from the devices and asks you to confirm |
+| The destination account group | the `target` column, a `prefix_map.csv`, or one question |
+| The agent web UI login | the tool asks (hidden) and checks it on every device before the first reset |
+| The registration token of each destination group ("Account Group Token" in the ThousandEyes UI, under Add New Enterprise Agent) | the tool asks (hidden), once per destination group, and checks its format |
 
 There are no environment variables and no `.env` file to prepare. Secrets are never written to disk.
+A wrong token or password is asked again (3 tries) with the number of characters that was received.
 
 The tool checks that the name and the IP address belong to the same agent in the source group.
 If they do not match, the device is blocked and nothing is touched. This protects you from moving
@@ -69,9 +71,10 @@ destination group becomes the owner of the new agent.
 
 ## Setup (once)
 
-There is no virtual environment. The tool runs with the Python you already have. One command
-copies the three small libraries it needs (`requests` and `urllib3`) into a `libs`
-folder inside the project. Nothing is installed into your Python and nothing needs activating.
+There is no virtual environment. The tool runs with the Python you already have. The first time you start
+it, it offers to copy the two small libraries it needs (`requests` and `urllib3`) into a `libs` folder inside
+the project (answer `Y`). Nothing is installed into your Python and nothing needs activating. If you prefer
+to do it by hand, use the commands below.
 
 You need Python 3.6 or newer, built with OpenSSL 1.1.1 or newer (TLS 1.3).
 Use a Python from python.org or Homebrew. Apple's `/usr/bin/python3` is too old.
@@ -96,7 +99,8 @@ python -c "import ssl; print(ssl.OPENSSL_VERSION, ssl.HAS_TLSv1_3)"
 ```
 
 The last line must end with `True`. If it says `False`, agents that need TLS 1.3 will refuse the
-connection: use a newer Python. To remove the libraries later, delete the `libs` folder.
+connection: use a newer Python (the tool also warns you at the start). To remove the libraries later,
+delete the `libs` folder.
 
 ## Migrate
 
@@ -110,6 +114,9 @@ connection: use a newer Python. To remove the libraries later, delete the `libs`
 
 ### 1. Write the inventory
 
+Make the folder and copy the example. Or skip this: when the file does not exist the tool asks you to type
+the devices (`name ip`, one per line) and saves them.
+
 ```bash
 mkdir -p work/input                                    # macOS or Linux
 cp examples/inventory.example.csv work/input/inventory.csv
@@ -120,16 +127,23 @@ mkdir work\input
 copy examples\inventory.example.csv work\input\inventory.csv
 ```
 
-Edit `work/input/inventory.csv`. One line for each device:
+Edit `work/input/inventory.csv`. One line for each device. Two columns are enough:
 
 ```
-type,name,ip_address,target_aid
-agent,MyAgent-01,10.1.1.5,200
-agent,MyAgent-02,10.1.1.6,200
+name,ip_address
+MyAgent-01,10.1.1.5
+MyAgent-02,10.1.1.6
 ```
 
 - `name` and `ip_address` must be exactly those of the agent in the source group.
-- `target_aid` is the destination group ID. Each device can have a different one.
+- Optional `target` column: the destination group, as an ID or as the exact group name.
+  Each device can have a different one. Without it the tool uses `work/input/prefix_map.csv` (see
+  "Examples") and otherwise asks once for the destination of the run.
+- Optional `type` column (`agent` or `cluster`). Without it a line with an IP is a standalone agent, and a
+  line without an IP is looked up as a cluster.
+- The tool accepts other spellings of the column names (`hostname`, `ip`, `destination` ...), `,` `;` or a
+  tab as separator, a file saved by Excel, and a file without a header line (`name,ip`). Columns it does not
+  know are ignored; a column that looks like a password or token is refused.
 - Start with one device.
 
 ### 2. Preview (nothing changes)
@@ -138,9 +152,11 @@ agent,MyAgent-02,10.1.1.6,200
 python3 -m te_agent_migrate        # Windows: python -m te_agent_migrate
 ```
 
-The tool asks for what it needs, checks every device and prints the plan. It writes the report to
-`work/dry-run`. Each preview replaces the previous one. If a device is blocked, the output gives the
-reason (see "If the preview says" below). Fix it and run again.
+The tool asks for what it needs, finds the source group (it looks for the devices in your account groups and
+asks `Use it? [Y/n]`), checks every device and prints the plan. It writes the report to `work/dry-run`. Each
+preview replaces the previous one. If a device is blocked, the output gives the reason (see
+"If the preview says" below). Fix it and run again. The preview also warns about agent UIs that this computer
+cannot reach on port 443.
 
 ### 3. Apply (moves the devices)
 
@@ -150,12 +166,23 @@ python3 -m te_agent_migrate --apply
 
 The tool finds the last preview by itself. If the inventory or the account groups changed since then,
 it says so, shows the new plan and asks again. It also asks you to confirm that the source group is the
-owner of the devices (see below), then `y` or `n`, then moves the devices one at a time.
+owner of the devices (see below). Before the first reset it checks that every agent UI answers and accepts the
+login, so a wrong password or a blocked port stops the run while nothing has been changed. Then `y` or `n`, then
+it moves the devices one at a time.
 
 **Apply resets the real agent. A reset cannot be undone.** Do not press Ctrl-C during a device.
 The tool stops at the first failure and prints the state of that device. It never changes an offline
 device. Before each device it saves a snapshot, and the reports of an apply are in `work/apply/<date-time>`.
 A device that was moved is remembered (`work/state/migrated.json`), so running the tool again skips it.
+
+### If a run stops half way
+
+A timeout, a closed window or a network drop can stop a run after the new agent is online but before the end.
+Run the same command again. The tool finds the device by itself (the old agent is offline and the new agent is
+in the destination group), says what is left, and in `--apply` asks `Finish these N migration(s) now?`. It
+adds the missing tests and shares, deletes the old agent, restores the name and the tags. It only does what
+is missing, so you can run it as many times as you need. It needs the snapshot that the earlier run saved in
+`work/apply` (or `work/runs`).
 
 ## The options
 
@@ -206,15 +233,25 @@ tests to the new agent, by itself. The preview tells you how many there are.
 **Several devices to different destinations (one registration token per destination):**
 
 ```
-type,name,ip_address,target_aid
-agent,MyAgent-01,10.1.1.5,200
-agent,MyAgent-02,10.1.1.6,200
-agent,MyAgent-03,10.1.1.7,250
+name,ip_address,target
+MyAgent-01,10.1.1.5,200
+MyAgent-02,10.1.1.6,200
+MyAgent-03,10.1.1.7,Div Capital
 ```
 
 ```
  100 (source) --+--> MyAgent-01, MyAgent-02 --> 200
-                +--> MyAgent-03             --> 250
+                +--> MyAgent-03             --> Div Capital
+```
+
+**Destination from the device name, with a prefix map.** For names like `AAAA - HOST01` the tool can place
+the devices by the text before ` - `. Put `work/input/prefix_map.csv` next to the inventory (see
+`examples/prefix_map.example.csv`); the lines with status `OK` are used, the lines with `REVIEW` are not:
+
+```
+prefix,group_name,aid,status
+AAAA,Div_A,100,OK
+BBBB,Div_B,200,OK
 ```
 
 ## If the preview says
@@ -222,6 +259,10 @@ agent,MyAgent-03,10.1.1.7,250
 | Message | What to do |
 |---|---|
 | No agent matches IP and name | Check the name and the IP address in the inventory |
+| migration(s) of an earlier run did not finish | A run stopped half way. Run with `--apply` to finish it (see above) |
+| The destination ... is not an account group that the token can access | The `target` column has a group name or ID that the token cannot see. Fix it in the inventory |
+| These agent UIs do not answer on port 443 | This computer cannot reach the agent. Fix the network or take the device out of the inventory |
+| The agent UI refused the user name or password | Type the agent UI login again when asked |
 | owner group not proven to be the source group | Normal. In `--apply` you confirm the owner |
 | the target group already sees this device | Only a warning: the device was shared with the destination group before. It is moved if the source group owns it |
 | Already migrated (skipped) | The device is in the destination group already |

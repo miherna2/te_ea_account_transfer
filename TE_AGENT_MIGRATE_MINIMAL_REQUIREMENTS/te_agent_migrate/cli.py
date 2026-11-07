@@ -1,20 +1,25 @@
 """Argparse command-line entry point for Python 3.6 through 3.9."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import shutil
+import ssl
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 from te_agent_migrate.api_client import ThousandEyesApiClient
-from te_agent_migrate.errors import ConfigurationError, MigrationError
-from te_agent_migrate.inventory import describe_inventory, load_inventory
+from te_agent_migrate.autodetect import detect_source, resolve_targets
+from te_agent_migrate.errors import ApiError, ConfigurationError, MigrationError
+from te_agent_migrate.inventory import capture_inventory, describe_inventory, load_inventory
 from te_agent_migrate.models import Mode, StepStatus
 from te_agent_migrate.operator import OperatorPrompter
+from te_agent_migrate.precheck import check_devices
+from te_agent_migrate.resume import find_interrupted, load_snapshots, resume_device
 from te_agent_migrate.output import MigrationConsole, mask_secrets
 from te_agent_migrate.redaction import redact_value
 from te_agent_migrate.reporting import RunReport
@@ -42,6 +47,9 @@ DEFAULT_INVENTORY = WORK_DIR / "input" / "inventory.csv"
 DRY_RUN_DIR = WORK_DIR / "dry-run"      # the latest preview only: it is emptied at the start of each preview
 APPLY_ROOT = WORK_DIR / "apply"         # one timestamped folder per apply: snapshots and logs are evidence
 MIGRATED_FILE = WORK_DIR / "state" / "migrated.json"
+PREFIX_MAP_FILE = WORK_DIR / "input" / "prefix_map.csv"   # optional: device name prefix -> destination group
+TOKEN_TRIES = 3
+UI_LOGIN_TRIES = 3
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_REFUSED = 2
@@ -132,6 +140,87 @@ def _apply_stamp():
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+class _UiCredentials(object):
+    """The agent UI login. Calling it returns (user, password); ``replace`` stores a corrected pair."""
+
+    def __init__(self, pair):
+        self._pair = pair
+
+    def __call__(self):
+        return self._pair
+
+    def replace(self, username, password):
+        self._pair = (username, password)
+
+
+def _finish_interrupted(console, prompter, report, api, source, agents, kwargs, snapshot_dir, target_names,
+                        apply_mode):
+    """Find migrations of an earlier run that stopped half way and, in apply mode, finish them.
+
+    Return False when the run must stop (a device could not be finished), else True.
+    """
+    try:
+        interrupted = find_interrupted(api, source.aid, agents, load_snapshots(WORK_DIR), console)
+    except Exception as exc:  # looking is optional: a failure here must not stop a normal migration
+        console.info("resume", "could not look for earlier runs that stopped half way (%s)" % _mask_exception(exc))
+        return True
+    if not interrupted:
+        return True
+    console.info("resume", "%d migration(s) of an earlier run did not finish:" % len(interrupted))
+    for entry in interrupted:
+        console.info("resume", "  - %s" % entry.describe())
+    if not apply_mode:
+        console.info("resume", "Run the same command with --apply to finish them first.")
+        return True
+    if prompter.required_choice("Finish these %d migration(s) now?" % len(interrupted), ("y", "n")) != "y":
+        report.record_decision("Finish earlier runs", "no")
+        return True
+    report.record_decision("Finish earlier runs", "yes")
+    ctx = _build_flow_context(dict(kwargs, apply=True, target_account_token=""), str(snapshot_dir))
+    ctx.target_names = dict(target_names)
+    console.play("Finish earlier runs", Mode.APPLY)
+    for entry in interrupted:
+        try:
+            result = resume_device(ctx, entry)
+        except FlowAborted as exc:
+            console.status(StepStatus.FAILED, entry.name, "resume", _mask_exception(exc))
+            report.record_decision("Finish earlier runs", "failed for %s" % entry.name)
+            return False
+        console.status(StepStatus.OK, entry.name, "resume", result.detail)
+    return True
+
+
+def _precheck_devices(console, prompter, report, items, get_ui_credentials):
+    """Before the first reset: every agent UI answers and accepts the login. Return True when all do.
+
+    A refused login is asked again (3 tries). A UI that does not answer stops the run: retyping does not
+    help, and a reset cannot be undone.
+    """
+    for attempt in range(1, UI_LOGIN_TRIES + 1):
+        result = check_devices(items, _make_ip_ui_factory(get_ui_credentials))
+        if result.ok:
+            console.info("precheck", "%d agent UI(s) answer and accept the login" % result.checked)
+            report.record_decision("Pre-reset checks", "ok")
+            return True
+        if result.unreachable:
+            console.info("precheck", "These agent UIs do not answer on port 443 from this computer: %s. "
+                                     "Fix the network or take them out of the inventory."
+                         % "; ".join(result.unreachable))
+        for text in result.other:
+            console.info("precheck", "The agent UI answered badly: %s" % text)
+        if result.unreachable or result.other:
+            break
+        console.info("precheck", "The agent UI refused the user name or password on %d device(s): %s"
+                     % (len(result.bad_login), "; ".join(result.bad_login[:5])))
+        if attempt == UI_LOGIN_TRIES or not hasattr(get_ui_credentials, "replace"):
+            break
+        console.info("input", "Type the agent UI login again (try %d of %d)" % (attempt + 1, UI_LOGIN_TRIES))
+        get_ui_credentials.replace(prompter.text("Agent UI username"), prompter.secret("Agent UI password"))
+    report.record_decision("Pre-reset checks", "failed")
+    console.info("run", "pre-reset checks failed; nothing was changed")
+    return False
+
+
 def _resolve_agent_ui_inputs(report, prompter, console):
     ui_username = _environment_value(UI_USERNAME_ENV)
     if ui_username is None:
@@ -148,7 +237,7 @@ def _resolve_agent_ui_inputs(report, prompter, console):
     return ui_username, ui_password
 
 
-def _group_from_env(groups, env_name, label, prompter):
+def _group_from_env(groups, env_name, label, prompter, exclude_aid=None):
     value = os.getenv(env_name)
     if value:
         group = next((item for item in groups if item.aid == value), None)
@@ -159,7 +248,53 @@ def _group_from_env(groups, env_name, label, prompter):
             "%s [%s] via environment" % (group.name, group.aid),
         )
         return group
-    return prompter.choose_account_group("Select %s account group" % label, groups)
+    choices = [group for group in groups if group.aid != exclude_aid]
+    return prompter.choose_account_group("Select %s account group" % label, choices)
+
+
+def _source_group(api, groups, agents, prompter, console):
+    """The source group: from TE_SOURCE_AID (labs), else found by looking for the devices."""
+    if os.getenv("TE_SOURCE_AID"):
+        return _group_from_env(groups, "TE_SOURCE_AID", "source", prompter)
+    return detect_source(api, groups, agents, prompter, console)
+
+
+def _auth_failed(exc):
+    text = str(exc)
+    return "HTTP 401" in text or "HTTP 403" in text
+
+
+def _open_api(stack, prompter, report, console):
+    """Open the API client and read the account groups. Return (api, groups).
+
+    A token typed on the console is checked at once: a rejected token is asked again (3 tries) with the
+    number of characters that was received, because a short or cut paste is the usual cause. A token from the
+    environment (labs) is tried once.
+    """
+    env_token = os.getenv("TE_OAUTH_TOKEN") or os.getenv("THOUSANDEYES_OAUTH_TOKEN")
+    tries = 1 if env_token else TOKEN_TRIES
+    if env_token:
+        report.record_decision("API v7 OAuth bearer token", "<environment>")
+        console.info("input", "API OAuth token loaded from environment")
+    for attempt in range(1, tries + 1):
+        token = env_token or prompter.secret("API v7 OAuth bearer token")
+        attempt_stack = contextlib.ExitStack()
+        api = attempt_stack.enter_context(ThousandEyesApiClient(token))
+        console.progress("global", "api_account_groups", "connecting to ThousandEyes API v7")
+        try:
+            groups = api.list_account_groups()
+        except ApiError as exc:
+            attempt_stack.close()
+            if env_token or attempt == tries or not _auth_failed(exc):
+                raise
+            console.info(
+                "input",
+                "The API did not accept that token (%d characters received). Copy the whole token again "
+                "(try %d of %d)." % (len(token), attempt + 1, tries),
+            )
+            continue
+        stack.callback(attempt_stack.close)
+        return api, groups
 
 
 def _utc_now_text():
@@ -722,6 +857,11 @@ def _run_migration(
     owner_is_source = True
     migrated_ids = _load_migrated_ids(console)
     all_aids = [group.aid for group in groups]
+    if not _finish_interrupted(console, prompter, report, api, source, agents, kwargs, snapshot_dir,
+                               target_names, apply_mode):
+        console.info("run", "an earlier run could not be finished; no other device was started")
+        report.write_final()
+        return EXIT_FAILED
     if apply_mode:
         # Show a fresh, read-only preflight BEFORE the operator is asked to confirm.
         # The context is a dry-run context: its API wrapper refuses every write call.
@@ -776,6 +916,9 @@ def _run_migration(
             console.info("run", "owner not confirmed; nothing was changed")
             report.write_final()
             return EXIT_FAILED
+        if not _precheck_devices(console, prompter, report, pre_items, get_ui_credentials):
+            report.write_final()
+            return EXIT_FAILED
         if not prompter.confirm_destructive():
             report.record_decision("Apply", "operator declined")
             console.info("run", "operator declined; nothing was changed")
@@ -826,6 +969,12 @@ def _run_migration(
     clean = code == EXIT_OK
     if apply_mode:
         _remember_migrated(console, results)
+    else:
+        # The preview has no UI login, but it can already say which agent UIs this computer cannot reach.
+        reach = check_devices(getattr(results, "preflight_items", None) or [])
+        if reach.unreachable:
+            console.info("precheck", "WARNING: these agent UIs do not answer on port 443 from this computer "
+                                     "(--apply stops on them): %s" % "; ".join(reach.unreachable))
     confirmation = None
     nothing_ready = False
     if not apply_mode:
@@ -900,6 +1049,11 @@ def _main(argv=None):
                 "Codex network sandbox blocks direct agent HTTPS/443 connections. "
                 "Run this command from a local terminal outside Codex."
             )
+        if not ssl.HAS_TLSv1_3:
+            console.info("startup", "WARNING: this Python has no TLS 1.3 (%s). Agents that require it will refuse "
+                                    "the connection; use a newer Python." % ssl.OPENSSL_VERSION)
+        if not inventory.is_file() and sys.stdin.isatty():
+            capture_inventory(inventory, input)
         console.progress("global", "inventory", "reading %s" % inventory)
         agents = load_inventory(inventory)
         console.status(StepStatus.OK, "global", "inventory", "loaded %s agent(s)" % len(agents))
@@ -913,31 +1067,24 @@ def _main(argv=None):
             # The agent UI credentials are asked only if a flow really opens the UI.
             get_ui_credentials = _lazy(lambda: _resolve_agent_ui_inputs(report, prompter, console))
         else:
-            credentials = _resolve_agent_ui_inputs(report, prompter, console)
-            get_ui_credentials = lambda: credentials
-        api_token = os.getenv("TE_OAUTH_TOKEN") or os.getenv("THOUSANDEYES_OAUTH_TOKEN")
-        if api_token:
-            report.record_decision("API v7 OAuth bearer token", "<environment>")
-            console.info("input", "API OAuth token loaded from environment")
-        else:
-            api_token = prompter.secret("API v7 OAuth bearer token")
-        with ThousandEyesApiClient(api_token) as api:
-            console.progress("global", "api_account_groups", "connecting to ThousandEyes API v7")
-            groups = api.list_account_groups()
+            get_ui_credentials = _UiCredentials(_resolve_agent_ui_inputs(report, prompter, console))
+        with contextlib.ExitStack() as stack:
+            api, groups = _open_api(stack, prompter, report, console)
             console.status(
                 StepStatus.OK,
                 "global",
                 "api_account_groups",
                 "OAuth token can access %s account group(s)" % len(groups),
             )
-            # An unknown row target stops the run before any prompt or flow.
+            # Group names and the prefix map become group ids; an unknown target stops the run before any prompt.
+            resolve_targets(agents, groups, PREFIX_MAP_FILE, console)
             _check_inventory_targets(agents, groups)
-            source = _group_from_env(groups, "TE_SOURCE_AID", "source", prompter)
+            source = _source_group(api, groups, agents, prompter, console)
             own_targets = any(agent.target_aid for agent in agents)
             # When every row names its target, the run needs no target of its own.
             needs_target = _needs_run_target(agents)
             if needs_target:
-                target = _group_from_env(groups, "TE_TARGET_AID", "target", prompter)
+                target = _group_from_env(groups, "TE_TARGET_AID", "target", prompter, exclude_aid=source.aid)
             else:
                 # Every row has its own target. The run target is the first one (for the context only).
                 target = next(group for group in groups if group.aid == agents[0].target_aid)

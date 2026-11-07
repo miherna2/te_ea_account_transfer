@@ -5,7 +5,7 @@ Order of the sources for one target aid:
 1. The environment variable ``TE_TARGET_TOKEN_<aid>``, for example ``TE_TARGET_TOKEN_100``.
 2. The single-target pair ``TE_TARGET_ACCOUNT_TOKEN`` plus ``TE_TARGET_ACCOUNT_TOKEN_AID``,
    when the aid of the pair is this aid.
-3. A hidden prompt.
+3. A hidden prompt (checked at once; a wrong token is asked again, 3 tries).
 
 A token is cleaned (white space and invisible characters removed) and must have exactly
 32 letters or digits. A token is never printed, never logged and never written to a file.
@@ -17,6 +17,7 @@ import unicodedata
 
 from te_agent_migrate.errors import ConfigurationError
 
+PROMPT_TRIES = 3
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9]{32}$")
 TOKEN_ENV_PREFIX = "TE_TARGET_TOKEN_"
 LEGACY_TOKEN_ENV = "TE_TARGET_ACCOUNT_TOKEN"
@@ -127,12 +128,25 @@ class TargetTokens(object):
         value = self._from_environment(aid, label)
         if value is None:
             value = self._from_legacy_pair(aid, label)
-        if value is None:
-            value = self.prompter.secret("Target account-group token for %s" % label)
+        if value is not None:
+            token = clean_token(value, self.console)
+        else:
+            token = self._ask(label)
             self.report.record_decision("Target account-group token for %s" % label, "hidden prompt")
-        token = clean_token(value, self.console)
         self._cache[aid] = token
         return token
+
+    def _ask(self, label):
+        """Ask on the console. A token that is not 32 letters or digits is asked again (3 tries)."""
+        for attempt in range(1, PROMPT_TRIES + 1):
+            value = self.prompter.secret("Target account-group token for %s" % label)
+            try:
+                return clean_token(value, self.console)
+            except ConfigurationError as exc:
+                if attempt == PROMPT_TRIES:
+                    raise
+                self.console.info("input", "%s. Copy the whole token again (try %d of %d)."
+                                  % (exc, attempt + 1, PROMPT_TRIES))
 
     def collect(self, aids):
         """Resolve every aid now. Returns {aid: token}. Call it before the first device is changed."""

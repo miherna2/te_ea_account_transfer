@@ -26,6 +26,8 @@ Matching rules (nothing is guessed)
   inventory row must agree with that record. Otherwise blocked. If only one of
   the two agrees, the item stays ready and gets a warning.
 * Cluster: by ``agent_id`` (cluster id) or by exact cluster name. Never by IP.
+* Inventory row without a ``type`` (``auto_kind``): a standalone agent when name and IP match one, else a
+  cluster when exactly one cluster has that name.
 
 Sharing rules
 -------------
@@ -670,6 +672,18 @@ def _already_migrated(inv, groups, target, source_records):
             if t.online and str(t.agent_id) not in source_ids]
 
 
+def _auto_kind(inv, source_records):
+    """A row without a ``type`` is an agent when name and IP match one, else a cluster when one has that name."""
+    if not getattr(inv, 'auto_kind', False) or inv.agent_id or inv.is_cluster:
+        return
+    if _live_by_name_ip(inv, source_records):
+        return
+    name = _norm_name(inv.hostname)
+    clusters = [r for r in source_records if r.is_cluster and _norm_name(r.name) == name]
+    if len(clusters) == 1:
+        inv.kind = 'cluster'
+
+
 def _lookup(inv, groups, source, target, source_records, run_warnings):
     """Find the device in the source group. Return (record, problem, warnings, done_item).
 
@@ -711,6 +725,7 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
     except ApiError as exc:
         return _blocked(inv, ['cannot read agents of the source group %s: %s' % (source, _err(exc))])
 
+    _auto_kind(inv, source_records)
     record, problem, warnings, done = _lookup(inv, groups, source, target, source_records, run_warnings)
     if done is not None:
         return done
