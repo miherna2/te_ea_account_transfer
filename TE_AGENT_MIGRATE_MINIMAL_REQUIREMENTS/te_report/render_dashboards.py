@@ -68,6 +68,11 @@ def render(dashboards, widgets, summary, meta=None):
     out.append("<meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'\">")
     out.append("<title>Dashboard impact</title><style>%s</style></head><body>" % _CSS)
     out.append("<h1>Dashboard impact: will a widget break after the move?</h1>")
+    if meta.get("complete") is False:
+        out.append("<p role='alert'><strong>INCOMPLETE discovery: required agent/test data is missing "
+                   "or unreadable. Impact findings cannot establish complete coverage.</strong></p>")
+        gaps = (meta.get("required_missing") or []) + (meta.get("required_errors") or [])
+        out.append("<p>Required discovery gaps: %s</p>" % _e(", ".join(gaps)))
     out.append("<div class='small'>Generated %s. Input: %s. Selected agents: %s.</div>" % (
         _e(meta.get("generated", "")), _e(meta.get("input", "")), _e(meta.get("selected", ""))))
 

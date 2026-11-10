@@ -40,6 +40,12 @@ PAGE_KEYS = {
     "dashboard_filters": ("dashboardFilters",),
 }
 
+REQUIRED_GROUP_FILES = {"agents": "agentId", "tests": "testId"}
+
+
+class DiscoveryInputError(ValueError):
+    """The discovery directory has no trustworthy account-group inventory."""
+
 
 def is_secret_name(name):
     """True when a field name must never be loaded."""
@@ -99,15 +105,56 @@ def extract_items(data, keys):
     return items
 
 
-def _load_optional(path, rel, result):
-    if not os.path.isfile(path):
-        result["missing"].append(rel)
-        return None
+def _issue(result, kind, rel, required=False):
+    if rel not in result[kind]:
+        result[kind].append(rel)
+    if required and rel not in result["required_" + kind]:
+        result["required_" + kind].append(rel)
+
+
+def _valid_collection(data, keys, id_key):
+    """Validate supported page shapes, including an explicitly empty list."""
+    if not isinstance(data, (dict, list)):
+        return False
+    pages = [data] if isinstance(data, dict) else data
+    for page in pages:
+        if isinstance(page, dict):
+            for key in keys:
+                if key in page:
+                    values = page[key]
+                    break
+            else:
+                if not _valid_identifier(page.get(id_key)):
+                    return False
+                continue
+        elif isinstance(page, list):
+            values = page
+        else:
+            return False
+        if not isinstance(values, list) or not all(
+                isinstance(item, dict) and _valid_identifier(item.get(id_key))
+                for item in values):
+            return False
+    return True
+
+
+def _valid_identifier(value):
+    return isinstance(value, (str, int)) and not isinstance(value, bool) and bool(str(value).strip())
+
+
+def _load_optional(path, rel, result, required=False, keys=(), id_key=None):
     try:
-        return scrub(_read_json(path))
-    except (ValueError, OSError):
-        result["errors"].append(rel)
+        data = scrub(_read_json(path))
+    except FileNotFoundError:
+        _issue(result, "missing", rel, required)
         return None
+    except (ValueError, UnicodeError, OSError):
+        _issue(result, "errors", rel, required)
+        return None
+    if required and not _valid_collection(data, keys, id_key):
+        _issue(result, "errors", rel, True)
+        return None
+    return data
 
 
 def _agent_detail_name(name):
@@ -120,45 +167,63 @@ def _agent_detail_name(name):
 def load_discovery(path):
     """Load a discovery_output directory into a plain dict.
 
-    Result keys: ``path``, ``missing`` (relative paths of absent optional
-    files), ``errors`` (unreadable files), ``account_groups`` (list of
+    Invalid input directories or account-group listings raise DiscoveryInputError.
+    Result keys: ``path``, ``missing`` (relative paths of absent files),
+    ``errors`` (unreadable or malformed files), ``required_missing`` and
+    ``required_errors`` (critical agents/tests gaps), ``complete`` (no critical
+    gaps), ``usable`` (at least one valid agents/tests dataset), ``account_groups`` (list of
     ``{aid, accountGroupName}``), ``groups`` (aid -> per-group data) and
     ``agent_details`` (agentId -> list of detail dicts, each with ``_aid``).
     """
+    if not os.path.isdir(path):
+        raise DiscoveryInputError("discovery input must be an existing directory")
     result = {
         "path": path,
         "missing": [],
         "errors": [],
+        "required_missing": [],
+        "required_errors": [],
+        "complete": False,
+        "usable": False,
         "account_groups": [],
         "groups": {},
         "agent_details": {},
     }
 
     groups_data = _load_optional(
-        os.path.join(path, "account_groups.json"), "account_groups.json", result
+        os.path.join(path, "account_groups.json"), "account_groups.json", result,
+        required=True, keys=("accountGroups",), id_key="aid",
     )
     known = []
     if groups_data is not None:
         for item in extract_items(groups_data, ("accountGroups",)):
-            if item.get("aid") is None:
+            aid = str(item["aid"]).strip()
+            if not re.match(r"^[A-Za-z0-9_-]+$", aid):
+                raise DiscoveryInputError("account_groups.json contains an invalid account-group id")
+            if any(group["aid"] == aid for group in known):
                 continue
             known.append(
                 {
-                    "aid": str(item.get("aid")),
+                    "aid": aid,
                     "accountGroupName": item.get("accountGroupName"),
                 }
             )
+    if not known:
+        raise DiscoveryInputError("account_groups.json is missing, unreadable, or has no usable account groups")
     result["account_groups"] = known
     names = dict((g["aid"], g["accountGroupName"]) for g in known)
 
     aids = [g["aid"] for g in known]
-    if os.path.isdir(path):
-        for entry in sorted(os.listdir(path)):
-            if entry.startswith("aid_") and os.path.isdir(os.path.join(path, entry)):
-                aid = entry[4:]
-                if aid not in aids:
-                    aids.append(aid)
-                    result["account_groups"].append({"aid": aid, "accountGroupName": None})
+    try:
+        entries = sorted(os.listdir(path))
+    except OSError:
+        raise DiscoveryInputError("discovery input directory could not be read") from None
+    for entry in entries:
+        if entry.startswith("aid_") and os.path.isdir(os.path.join(path, entry)):
+            aid = entry[4:]
+            if re.match(r"^[A-Za-z0-9_-]+$", aid) and aid not in aids:
+                aids.append(aid)
+                result["account_groups"].append({"aid": aid, "accountGroupName": None})
     for aid in aids:
         if not os.path.isdir(os.path.join(path, "aid_" + aid)):
             result["missing"].append("aid_%s/" % aid)
@@ -181,12 +246,19 @@ def load_discovery(path):
         }
         result["groups"][aid] = group
         if not os.path.isdir(gdir):
+            for fname in REQUIRED_GROUP_FILES:
+                _issue(result, "missing", "aid_%s/%s.json" % (aid, fname), True)
             continue
 
         raw = {}
         for fname in GROUP_FILES:
             rel = "aid_%s/%s.json" % (aid, fname)
-            data = _load_optional(os.path.join(gdir, fname + ".json"), rel, result)
+            required = fname in REQUIRED_GROUP_FILES
+            data = _load_optional(os.path.join(gdir, fname + ".json"), rel, result,
+                                  required=required, keys=PAGE_KEYS[fname],
+                                  id_key=REQUIRED_GROUP_FILES.get(fname))
+            if required and data is not None:
+                result["usable"] = True
             raw[fname] = extract_items(data, PAGE_KEYS[fname]) if data is not None else []
 
         group["agents"] = raw["agents"]
@@ -209,7 +281,12 @@ def load_discovery(path):
                 tags[tid].update(item)
         group["tags"] = [tags[t] for t in order]
 
-        for entry in sorted(os.listdir(gdir)):
+        try:
+            entries = sorted(os.listdir(gdir))
+        except OSError:
+            _issue(result, "errors", "aid_%s/" % aid)
+            entries = []
+        for entry in entries:
             if not entry.endswith(".json"):
                 continue
             full = os.path.join(gdir, entry)
@@ -232,7 +309,12 @@ def load_discovery(path):
 
     detail_dir = os.path.join(path, "agent_details")
     if os.path.isdir(detail_dir):
-        for entry in sorted(os.listdir(detail_dir)):
+        try:
+            entries = sorted(os.listdir(detail_dir))
+        except OSError:
+            _issue(result, "errors", "agent_details/")
+            entries = []
+        for entry in entries:
             parsed = _agent_detail_name(entry)
             if not parsed:
                 continue
@@ -247,6 +329,7 @@ def load_discovery(path):
                 result["agent_details"].setdefault(agent_id, []).append(data)
     else:
         result["missing"].append("agent_details/")
+    result["complete"] = not (result["required_missing"] or result["required_errors"])
     return result
 
 

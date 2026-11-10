@@ -22,9 +22,9 @@ Matching rules (nothing is guessed)
   BOTH the inventory IP and the inventory name (trimmed, case-insensitive).
   IP alone or name alone is never accepted. Zero matches or more than one ->
   blocked with a reason that says what matched and what differed.
-* Standalone agent with ``agent_id``: match by id, and the IP or the name of the
-  inventory row must agree with that record. Otherwise blocked. If only one of
-  the two agrees, the item stays ready and gets a warning.
+* Standalone agent with ``agent_id``: match by id, and the inventory IP must agree
+  with that record because it is the address whose UI will be reset. A differing
+  name is allowed with a warning when the id and IP identify the same device.
 * Cluster: by ``agent_id`` (cluster id) or by exact cluster name. Never by IP.
 * Inventory row without a ``type`` (``auto_kind``): a standalone agent when name and IP match one, else a
   cluster when exactly one cluster has that name.
@@ -71,6 +71,11 @@ changed, these are plain attributes, set on every item including blocked ones)
                  (the operator confirms it in apply mode); the dry-run file records ``assumed`` or ``proven``.
 ``a2a_targets``  list of dict ``{'aid', 'test_id', 'old_target_agent_id'}``, see "Agent-to-agent tests".
 
+Assigned tests are also read through their expanded detail endpoint before any reset. An explicit
+``sourceIpAddress`` on the selected source agent, cluster or member blocks migration: the test assignment
+POST does not preserve that interface selection. Unreadable or inconsistent source assignments block too.
+Interface selections on other source agents are allowed.
+
 Agent-to-agent tests (``ctx.repoint_a2a``, always on when run from the command line)
 ------------------------------------------------------------------------
 After a move the device gets a NEW agent id. An agent-to-agent test names its target by id
@@ -82,6 +87,9 @@ After a move the device gets a NEW agent id. An agent-to-agent test names its ta
   new agent is online, shared and has its tests, and before the old agent is deleted. A test with no readable
   ``targetAgentId`` becomes a BLOCKER (the repoint cannot be proven safe). A cluster that a2a tests target is a
   BLOCKER too ("a2a repoint is not supported for clusters").
+* Voice tests also reference a target agent id. A Voice test targeting the selected device, or with an
+  unreadable target id, is always a blocker. Voice target updates require manual repair; the a2a writer
+  does not support them.
 
 Target group rules
 ------------------
@@ -220,6 +228,7 @@ class _Groups(object):
         self._agents = {}
         self._tags = {}
         self._tests = {}
+        self._test_details = {}
 
     @staticmethod
     def _cached(store, key, loader):
@@ -244,6 +253,11 @@ class _Groups(object):
     def tests(self, aid):
         aid = str(aid)
         return self._cached(self._tests, aid, lambda: self.api.list_tests(aid))
+
+    def test_detail(self, aid, test):
+        key = (str(aid), str(test.test_type), str(test.test_id))
+        return self._cached(self._test_details, key,
+                            lambda: [self.api.get_test(*key)])[0]
 
 
 # ------------------------------------------------------------------ resolution
@@ -306,10 +320,11 @@ def _resolve(inv, records):
             return record, ('agent_id %s is %r (%s) but neither inventory IP %s nor inventory name %r agree'
                             % (wanted, record.name, ', '.join(record.ip_addresses) or 'no ip',
                                inv.ip_address or '-', inv.hostname)), []
-        warnings = []
         if not by_ip:
-            warnings.append('inventory IP %s is not an IP of agent %s (%s); matched by agent_id and name only'
-                            % (inv.ip_address or '-', record.agent_id, ', '.join(record.ip_addresses) or 'no ip'))
+            return record, ('inventory IP %s is not an IP of agent %s (%s); the agent UI reset address '
+                            'cannot be verified' % (inv.ip_address or '-', record.agent_id,
+                                                   ', '.join(record.ip_addresses) or 'no ip')), []
+        warnings = []
         if not by_name:
             warnings.append('inventory name %r differs from agent name %r; matched by agent_id and IP only'
                             % (inv.hostname, record.name))
@@ -511,6 +526,10 @@ def _is_a2a(test):
     return 'agent-to-agent' in str(test.test_type).lower()
 
 
+def _is_voice(test):
+    return str(test.test_type).strip().lower() == 'voice'
+
+
 def _target_agent_id(test):
     """Plain text id of ``targetAgentId``, or None when it is missing or not a plain id (dict, list, bool, empty)."""
     value = test.raw.get('targetAgentId')
@@ -519,13 +538,44 @@ def _target_agent_id(test):
     return str(value).strip()
 
 
+def source_interface_problem(test, selected_agent_ids, require_selected=True):
+    """Return a safe blocking reason for source configuration this flow cannot preserve.
+
+    ``test`` must be an expanded detail response: an unexpanded test listing cannot establish that an
+    agent has no selected source interface. Recovery may set ``require_selected=False`` after the old
+    source was already removed, while still checking any remaining old source assignments.
+    """
+    selected = set(str(value) for value in selected_agent_ids)
+    raw = getattr(test, 'raw', None)
+    assignments = raw.get('agents') if isinstance(raw, dict) else None
+    label = 'test %s' % test.test_id
+    if not isinstance(assignments, list):
+        return '%s has no readable expanded source agent configuration; source interfaces cannot be verified' % label
+    found = False
+    for assignment in assignments:
+        value = assignment.get('agentId', assignment.get('id')) if isinstance(assignment, dict) else assignment
+        if value is None or isinstance(value, (bool, dict, list, tuple)) or not str(value).strip():
+            return '%s has an unreadable source agent id; source interfaces cannot be verified' % label
+        if str(value).strip() not in selected:
+            continue
+        found = True
+        if isinstance(assignment, dict) and assignment.get('sourceIpAddress') not in (None, ''):
+            return ('%s selects sourceIpAddress on the device being migrated; automatic interface reassignment '
+                    'and readback are not supported. Remove the explicit interface selection or migrate manually'
+                    % label)
+    if require_selected and not found:
+        return '%s does not list the selected source agent; its source configuration cannot be verified' % label
+    return None
+
+
 def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, is_cluster=False,
-                 repoint_a2a=False, a2a_out=None):
+                 repoint_a2a=False, a2a_out=None, source_agent_ids=None):
     """Read tests once per group. Return test_enabled; fill warnings and blocked.
 
     ``repoint_a2a`` True: agent-to-agent tests that target the device are not a blocker for a standalone
     agent. They are appended to ``a2a_out`` as dict {aid, test_id, old_target_agent_id} (the caller adds the
     warning). An unreadable ``targetAgentId`` and a cluster target are blockers then. See the module docstring.
+    An unreadable test list always blocks: neither Voice nor a2a target dependencies can be ruled out.
     """
     agent_id = str(agent_id)
     test_enabled = {}
@@ -541,6 +591,9 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
                 # the repoint cannot be proven complete, and the old agent is deleted at the end.
                 blocked.append('cannot read tests in group %s; the agent-to-agent repoint cannot be proven '
                                'complete: %s' % (aid, _err(exc)))
+            else:
+                blocked.append('cannot read tests in group %s; Voice and agent-to-agent target dependencies '
+                               'cannot be proven safe: %s' % (aid, _err(exc)))
             test_enabled[aid] = dict((t, None) for t in wanted)
             continue
         by_id = dict((str(t.test_id), t) for t in listing)
@@ -549,6 +602,22 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
         unknown = []
         for test_id in wanted:
             test = by_id.get(str(test_id))
+            if test is None:
+                blocked.append('cannot read selected source configuration for test %s in group %s; source '
+                               'interfaces cannot be verified' % (test_id, aid))
+            else:
+                try:
+                    expanded = groups.test_detail(aid, test)
+                except ApiError:
+                    blocked.append('cannot read selected source configuration for test %s in group %s; source '
+                                   'interfaces cannot be verified' % (test_id, aid))
+                else:
+                    if str(expanded.test_id) != str(test_id):
+                        problem = 'test detail returned a different id; source interfaces cannot be verified'
+                    else:
+                        problem = source_interface_problem(expanded, source_agent_ids or [agent_id])
+                    if problem:
+                        blocked.append('group %s: %s' % (aid, problem))
             if test is None or 'enabled' not in test.raw or not isinstance(test.raw.get('enabled'), bool):
                 enabled[test_id] = None
                 unknown.append(test_id)
@@ -559,10 +628,19 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
             warnings.append('%d test(s) in group %s could not be read (enabled flag unknown): %s'
                             % (len(unknown), aid, _ids_text(unknown)))
 
-        # agent-to-agent tests that name this device as target
+        # Target dependencies can exist even when this device is not a source agent of the test.
         targeting = []
         unreadable_targets = 0
+        voice_targeting = []
+        unreadable_voice_targets = []
         for test in listing:
+            if _is_voice(test):
+                target = _target_agent_id(test)
+                if target is None:
+                    unreadable_voice_targets.append(str(test.test_id))
+                elif target == agent_id:
+                    voice_targeting.append(str(test.test_id))
+                continue
             if not _is_a2a(test):
                 continue
             target = _target_agent_id(test)
@@ -570,6 +648,14 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
                 unreadable_targets += 1
             elif target == agent_id:
                 targeting.append(str(test.test_id))
+        if voice_targeting:
+            blocked.append('%d voice test(s) in group %s use this device as target agent; update them '
+                           'manually before migration (automatic Voice target changes are not supported): %s'
+                           % (len(voice_targeting), aid, _ids_text(voice_targeting)))
+        if unreadable_voice_targets:
+            blocked.append('%d voice test(s) in group %s have no readable targetAgentId; target dependencies '
+                           'cannot be proven safe: %s'
+                           % (len(unreadable_voice_targets), aid, _ids_text(unreadable_voice_targets)))
         if targeting and repoint_a2a and is_cluster:
             blocked.append('a2a repoint is not supported for clusters (%d agent-to-agent test(s) in group %s '
                            'use this cluster as target agent): %s' % (len(targeting), aid, _ids_text(targeting)))
@@ -824,9 +910,16 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
 
     blocked = []
     a2a_targets = []
+    source_agent_ids = [agent_id]
+    for member in members:
+        for key in ('memberId', 'agentId', 'id'):
+            value = member.get(key)
+            if value is not None and not isinstance(value, (bool, dict, list, tuple)) and str(value).strip():
+                source_agent_ids.append(str(value).strip())
     test_enabled = _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked,
                                 is_cluster=bool(record.is_cluster),
-                                repoint_a2a=bool(getattr(ctx, 'repoint_a2a', False)), a2a_out=a2a_targets)
+                                repoint_a2a=bool(getattr(ctx, 'repoint_a2a', False)), a2a_out=a2a_targets,
+                                source_agent_ids=source_agent_ids)
     if a2a_targets and not blocked:
         warnings.append('%d agent-to-agent test(s) will be repointed after the move' % len(a2a_targets))
     if blocked:

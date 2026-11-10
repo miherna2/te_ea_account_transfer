@@ -23,7 +23,7 @@ from te_agent_migrate.resume import find_interrupted, load_snapshots, resume_dev
 from te_agent_migrate.output import MigrationConsole, mask_secrets
 from te_agent_migrate.redaction import redact_value
 from te_agent_migrate.reporting import RunReport
-from te_agent_migrate.flow.context import FlowAborted, FlowContext, a2a_targets_of, item_target_aid
+from te_agent_migrate.flow.context import FlowAborted, FlowContext, FlowResult, a2a_targets_of, item_target_aid
 from te_agent_migrate.flow.runner import run_migration
 from te_agent_migrate.flow.standalone import desired_share_aids
 from te_agent_migrate.target_tokens import TargetTokens
@@ -88,7 +88,8 @@ def build_parser():
             "same tests. Without --apply you only get a preview: nothing changes."
         ),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--apply", action="store_true",
         help="Move the devices. The tool shows the plan and asks you to confirm before it changes anything.",
     )
@@ -104,7 +105,7 @@ def build_parser():
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="More output.")
     # Old options. They are still accepted so that old instructions do not fail, but they do nothing now.
-    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    mode.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--owner-is-source", dest="owner_is_source", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--repoint-agent-to-agent", dest="repoint_agent_to_agent", action="store_true",
                         help=argparse.SUPPRESS)
@@ -148,6 +149,8 @@ class _UiCredentials(object):
         self._pair = pair
 
     def __call__(self):
+        if callable(self._pair):
+            self._pair = self._pair()
         return self._pair
 
     def replace(self, username, password):
@@ -155,16 +158,28 @@ class _UiCredentials(object):
 
 
 def _finish_interrupted(console, prompter, report, api, source, agents, kwargs, snapshot_dir, target_names,
-                        apply_mode):
+                        apply_mode, migrated_ids):
     """Find migrations of an earlier run that stopped half way and, in apply mode, finish them.
 
     Return False when the run must stop (a device could not be finished), else True.
+    Remember each successful replacement before continuing with the normal migration.
     """
+    known_completed = set(migrated_ids)
     try:
-        interrupted = find_interrupted(api, source.aid, agents, load_snapshots(WORK_DIR), console)
-    except Exception as exc:  # looking is optional: a failure here must not stop a normal migration
-        console.info("resume", "could not look for earlier runs that stopped half way (%s)" % _mask_exception(exc))
-        return True
+        interrupted = find_interrupted(api, source.aid, agents, load_snapshots(WORK_DIR), console,
+                                       target_aid=kwargs.get('target_aid'), completed_ids=migrated_ids)
+    except Exception as exc:
+        # Uncertain recovery must not fall through to another destructive reset.
+        console.info("resume", "cannot safely check earlier runs (%s); stopping before a new migration"
+                     % _mask_exception(exc))
+        report.record_decision("Finish earlier runs", "inspection failed")
+        return False
+    if apply_mode:
+        discovered = set(migrated_ids) - known_completed
+        _remember_migrated(console, [
+            FlowResult("completed recovery (agent %s)" % new_id, True, new_agent_id=new_id)
+            for new_id in sorted(discovered)
+        ])
     if not interrupted:
         return True
     console.info("resume", "%d migration(s) of an earlier run did not finish:" % len(interrupted))
@@ -187,6 +202,9 @@ def _finish_interrupted(console, prompter, report, api, source, agents, kwargs, 
             console.status(StepStatus.FAILED, entry.name, "resume", _mask_exception(exc))
             report.record_decision("Finish earlier runs", "failed for %s" % entry.name)
             return False
+        # Keep same-run protection even when the completion state cannot be saved.
+        migrated_ids.add(str(result.new_agent_id))
+        _remember_migrated(console, [result])
         console.status(StepStatus.OK, entry.name, "resume", result.detail)
     return True
 
@@ -324,6 +342,10 @@ def _load_dry_run_confirmation(path_text, inventory_path):
             % DRY_RUN_OK_FILENAME
         )
     path = Path(path_text)
+    if path.name.endswith(".used"):
+        raise PreconditionRefused(
+            "Dry-run confirmation has already been used: %s. Run the preview again. Nothing was changed." % path
+        )
     if not path.is_file():
         raise PreconditionRefused(
             "Dry-run confirmation file does not exist: %s. Run --dry-run first. "
@@ -592,6 +614,18 @@ def _dry_run_problems(data, items, owner_is_source, default_target_aid=None, rep
     expected = data.get("ready")
     if not isinstance(expected, list) or "excluded_ids" not in data or "owner_is_source" not in data:
         return ["the preview file has no device binding (old format)"]
+    if (not isinstance(data.get("excluded_ids"), list)
+            or not isinstance(data.get("skipped_ids", []), list)
+            or not isinstance(data.get("owner_is_source"), bool)
+            or not isinstance(data.get("repoint_a2a"), bool)
+            or any(not isinstance(entry, dict) for entry in expected)):
+        return ["the preview file has a malformed device binding"]
+    for entry in expected:
+        if any(not isinstance(entry.get(field), list)
+               for field in ("share_aids", "final_share_aids", "a2a_targets")):
+            return ["the preview file has a malformed device binding"]
+        if any(not isinstance(pair, list) or len(pair) != 2 for pair in entry["a2a_targets"]):
+            return ["the preview file has malformed agent-to-agent target bindings"]
     now = _dry_run_binding(items, owner_is_source, default_target_aid, repoint_a2a)
     problems = []
     if bool(data.get("repoint_a2a")) != now["repoint_a2a"]:
@@ -858,25 +892,40 @@ def _run_migration(
     owner_is_source = True
     migrated_ids = _load_migrated_ids(console)
     all_aids = [group.aid for group in groups]
+    strict_confirmation = apply_mode and bool(getattr(args, "confirmed_dry_run_file", None))
+    pre_ctx, pre_items = None, None
+    checked_migrated_ids = set(migrated_ids)
+
+    def read_current_preflight():
+        # The dry-run wrapper refuses writes, including when checking an explicitly named confirmation.
+        pre_kwargs = dict(kwargs, apply=False, target_account_token="")
+        current_ctx = _build_flow_context(pre_kwargs, str(snapshot_dir))
+        current_ctx.target_names = dict(target_names)
+        current_ctx.migrated_ids = set(migrated_ids)
+        current_items = run_preflight(
+            ctx=current_ctx, inventory_agents=agents, all_aids=all_aids,
+            assume_owner_source=owner_is_source,
+        )
+        return current_ctx, current_items
+
+    if strict_confirmation:
+        if dry_run_data is None:
+            dry_run_data = _load_dry_run_confirmation(str(gate_path), inventory_path)
+        _check_dry_run_groups(dry_run_data, source, _all_target_aids(agents, target))
+        pre_ctx, pre_items = read_current_preflight()
+        _compare_dry_run_binding(dry_run_data, pre_items, owner_is_source, default_target_aid, repoint_a2a)
+        if preflight_has_blockers(pre_items):
+            raise PreconditionRefused("Current preflight has blockers. Nothing was changed.")
     if not _finish_interrupted(console, prompter, report, api, source, agents, kwargs, snapshot_dir,
-                               target_names, apply_mode):
+                               target_names, apply_mode, migrated_ids):
         console.info("run", "an earlier run could not be finished; no other device was started")
         report.write_final()
         return EXIT_FAILED
     if apply_mode:
-        # Show a fresh, read-only preflight BEFORE the operator is asked to confirm.
-        # The context is a dry-run context: its API wrapper refuses every write call.
-        pre_kwargs = dict(kwargs, apply=False, target_account_token="")
-        pre_ctx = _build_flow_context(pre_kwargs, str(snapshot_dir))
-        pre_ctx.target_names = dict(target_names)
-        pre_ctx.migrated_ids = set(migrated_ids)
+        # Reuse the strict read-only check unless recovery changed which devices are already complete.
+        if pre_items is None or checked_migrated_ids != set(migrated_ids):
+            pre_ctx, pre_items = read_current_preflight()
         console.play("Preflight before confirmation", Mode.DRY_RUN)
-        pre_items = run_preflight(
-            ctx=pre_ctx,
-            inventory_agents=agents,
-            all_aids=all_aids,
-            assume_owner_source=owner_is_source,
-        )
         print_preflight(pre_ctx, pre_items)
         summary = preflight_summary(pre_items)
         console.info(
@@ -893,6 +942,9 @@ def _run_migration(
             differences = _dry_run_problems(dry_run_data, pre_items, owner_is_source, default_target_aid,
                                             repoint_a2a)
             if differences:
+                if strict_confirmation:
+                    _compare_dry_run_binding(dry_run_data, pre_items, owner_is_source, default_target_aid,
+                                             repoint_a2a)
                 console.info("gate", "WARNING: the situation changed since the last preview: %s"
                              % "; ".join(differences[:8]))
                 report.record_decision("Apply", "changed since the preview: %s" % "; ".join(differences[:8]))
@@ -1061,14 +1113,20 @@ def _main(argv=None):
         apply_mode = selected_mode is Mode.APPLY
         dry_run_data = None
         if apply_mode:
-            dry_run_data = _find_preview(gate_path, inventory, console)
+            if args.confirmed_dry_run_file:
+                dry_run_data = _load_dry_run_confirmation(str(gate_path), inventory)
+            else:
+                dry_run_data = _find_preview(gate_path, inventory, console)
             if dry_run_data is not None:
                 console.info("gate", "earlier preview found (created %s)" % dry_run_data.get("created_utc", "?"))
         if not apply_mode:
             # The agent UI credentials are asked only if a flow really opens the UI.
             get_ui_credentials = _lazy(lambda: _resolve_agent_ui_inputs(report, prompter, console))
         else:
-            get_ui_credentials = _UiCredentials(_resolve_agent_ui_inputs(report, prompter, console))
+            if args.confirmed_dry_run_file:
+                get_ui_credentials = _UiCredentials(lambda: _resolve_agent_ui_inputs(report, prompter, console))
+            else:
+                get_ui_credentials = _UiCredentials(_resolve_agent_ui_inputs(report, prompter, console))
         with contextlib.ExitStack() as stack:
             api, groups = _open_api(stack, prompter, report, console)
             console.status(
@@ -1099,6 +1157,8 @@ def _main(argv=None):
                 try:
                     _check_dry_run_groups(dry_run_data, source, all_target_aids)
                 except PreconditionRefused as exc:
+                    if args.confirmed_dry_run_file:
+                        raise
                     console.info("gate", "the earlier preview is for other groups; it is not used (%s)"
                                  % str(exc).split(". ")[0])
                     dry_run_data = None

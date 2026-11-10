@@ -255,6 +255,8 @@ def _validate(ctx, item):
         raise FlowAborted('device %s is kind %r; the standalone flow handles kind agent only' % (item.name, kind))
     if getattr(item, 'record', None) is None or not str(item.record.agent_id).strip():
         raise FlowAborted('device %s has no agent record; run preflight again' % item.name)
+    if item.record.is_cluster:
+        raise FlowAborted('refusing standalone migration of %s: it is a cluster; nothing was changed' % item.name)
     ip = _agent_ip(item)
     if not ip:
         raise FlowAborted('device %s has no IP address; the agent UI cannot be reached' % item.name)
@@ -389,10 +391,20 @@ def assign_until_present(ctx, host, aid, agent_id, test_ids, kept_text, on_batch
       * after ASSIGN_ROUNDS rounds with tests still missing it raises FlowAborted with the last error.
     It only adds tests. It never removes one.
     """
-    wanted = [str(t) for t in test_ids]
+    wanted = _unique(test_ids)
+    if not wanted:
+        return
     last_error = None
     for round_number in range(1, ASSIGN_ROUNDS + 1):
-        missing = [t for t in wanted if t not in _tests_on(ctx, aid, agent_id)]
+        try:
+            have = _tests_on(ctx, aid, agent_id)
+        except Exception as exc:
+            last_error = mask_secrets(str(exc)) or exc.__class__.__name__
+            ctx.console.info(host, 'aid %s: cannot read assigned tests (%s); will retry the read'
+                             % (aid, last_error))
+            ctx.sleep(ctx.poll_seconds if ctx.poll_seconds and ctx.poll_seconds > 0 else 1)
+            continue
+        missing = [t for t in wanted if t not in have]
         if not missing:
             return
         if round_number > 1:
@@ -412,11 +424,47 @@ def assign_until_present(ctx, host, aid, agent_id, test_ids, kept_text, on_batch
             ctx.console.info(host, 'aid %s: assigned %d test(s) (%d of %d)'
                              % (aid, len(batch), min(start + ASSIGN_CHUNK_SIZE, len(missing)), len(missing)))
         ctx.sleep(ctx.poll_seconds if ctx.poll_seconds and ctx.poll_seconds > 0 else 1)
-    missing = [t for t in wanted if t not in _tests_on(ctx, aid, agent_id)]
+    try:
+        have = _tests_on(ctx, aid, agent_id)
+    except Exception as exc:
+        raise FlowAborted('aid %s: could not verify assigned tests after %d rounds (%s); %s'
+                          % (aid, ASSIGN_ROUNDS, mask_secrets(str(exc)), kept_text))
+    missing = [t for t in wanted if t not in have]
     if missing:
         raise FlowAborted('aid %s: %d of %d tests are not assigned to %s after %d rounds (%s); last error: %s; %s'
                           % (aid, len(missing), len(wanted), agent_id, ASSIGN_ROUNDS, ','.join(missing[:10]),
                              last_error or 'none', kept_text))
+
+
+def _verify_enabled(ctx, item, new_id):
+    """Verify saved boolean test states without replaying a full test configuration."""
+    saved = getattr(item, 'test_enabled', None) or {}
+    for aid in _test_aids(item):
+        states = dict((str(t), value) for t, value in saved.get(aid, {}).items())
+        wanted = dict((str(t), states.get(str(t))) for t in item.tests_by_aid[aid]
+                      if isinstance(states.get(str(t)), bool))
+        if len(wanted) != len(set(str(t) for t in item.tests_by_aid[aid])):
+            ctx.console.info(item.name, 'aid %s: original enabled state is unknown for some tests; '
+                             'verify those states by hand' % aid)
+        if not wanted:
+            continue
+
+        def probe():
+            try:
+                current = dict((str(t.test_id), t.raw.get('enabled')) for t in ctx.api.list_tests(aid))
+            except Exception as exc:
+                raise FlowAborted('aid %s: cannot verify test enabled states on agent %s (%s); '
+                                  'check the saved states by hand before continuing'
+                                  % (aid, new_id, mask_secrets(str(exc))))
+            changed = [test_id for test_id, enabled in wanted.items()
+                       if not isinstance(current.get(test_id), bool) or current[test_id] != enabled]
+            return not changed, changed
+
+        done, changed = _poll_until(ctx, probe)
+        if not done:
+            raise FlowAborted('aid %s: test enabled states differ from the snapshot or cannot be read: %s; '
+                              'restore them by hand before continuing; no further migration steps were run'
+                              % (aid, ','.join(sorted(changed))))
 
 
 def _assign_tests(ctx, item, new_id):
@@ -445,6 +493,7 @@ def _assign_tests(ctx, item, new_id):
                 missing = sorted(needed - have)
                 raise FlowAborted('aid %s: %d of %d tests are not assigned to agent %s (%s); old agent was NOT deleted'
                                   % (aid, len(missing), len(needed), new_id, ','.join(missing[:10])))
+        _verify_enabled(ctx, item, new_id)
 
 
 def _a2a_state(new_id, old_id, done, pending):
@@ -510,7 +559,18 @@ def _delete_old(ctx, item, old_id, new_id, state=None):
         current = ctx.api.get_agent(ctx.target_aid, new_id)
         if not current.online:
             raise FlowAborted('new agent %s is not online (state %s); old agent was NOT deleted' % (new_id, current.state))
-        agent_type = _delete_type(ctx, owner, item.record, old_id)
+        names, ips = _name_candidates(item), _device_ips(item)
+        if (str(current.agent_id) != str(new_id) or current.is_cluster
+                or str(current.agent_type or '').casefold() != 'enterprise'
+                or not ThousandEyesApiClient.match_new_agents([current], names, ips, [])):
+            raise FlowAborted('new agent identity changed before cleanup; old agent was NOT deleted')
+        old = ctx.api.get_agent(owner, old_id)
+        agent_type = _delete_type(ctx, owner, old, old_id)
+        if (str(old.agent_id) != str(old_id) or old.is_cluster or agent_type.casefold() != 'enterprise'
+                or str(old.state or '').strip().casefold() != 'offline'
+                or not ThousandEyesApiClient.match_new_agents([old], names, ips, [], online_only=False)):
+            raise FlowAborted('old agent identity or offline state changed before cleanup; '
+                              'old agent was NOT deleted')
         if state is not None:
             state[0] = STATE_DELETE_SENT
         ctx.api.delete_agent(owner, old_id, agent_type=agent_type)
@@ -697,6 +757,7 @@ def _run(ctx, item, host, state):
 
     _delete_old(ctx, item, old_id, new_id, state)
     state[0] = STATE_DELETED
+    _verify_enabled(ctx, item, new_id)
 
     _rename(ctx, item, new_id)
     _restore_tags(ctx, item, new_id, warnings)

@@ -8,3 +8,23 @@ work/
 *.xlsx
 .playwright-mcp/
 libs/
+
+# Engineering sources, tests, and lab helpers stay local. See ../AGENTS.md.
+dev/
+tests/
+architecture/
+labs/
+sandbox/
+
+# Only the end-user runbook is published; architecture and lab notes stay local.
+!docs/
+docs/*
+!docs/OPERATIONS.md
+
+# Sandbox and lab configuration is local, including synthetic examples.
+examples/sandbox_map*.json
+examples/qualification_lab*.json
+
+# Secret configuration never becomes eligible through a source-file exception.
+.env
+.env.*

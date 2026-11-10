@@ -2,7 +2,7 @@
 
 import re
 
-from te_report.impact import LEVELS, is_offline, summarize
+from te_report.impact import LEVELS, summarize
 from te_report.outputs import (
     AGENT_COLUMNS, FINDING_COLUMNS, SHARE_COLUMNS, TREE_COLUMNS,
     all_offline_ids, offline_rows, safe_cell, selected_rows, share_rows, tree_rows,
@@ -160,6 +160,13 @@ def alert_rows(graph, findings):
 
 def summary_rows(graph, findings, selection, meta):
     rows = [("Report", "ThousandEyes agent migration: relationship report")]
+    if meta.get("complete") is False:
+        rows.append(("Discovery status", "INCOMPLETE: required agent/test data is missing or unreadable; "
+                     "impact findings cannot establish complete coverage"))
+        for path in meta.get("required_missing") or []:
+            rows.append(("Missing required file", path))
+        for path in meta.get("required_errors") or []:
+            rows.append(("Unreadable or invalid required file", path))
     if meta.get("generated"):
         rows.append(("Generated", meta["generated"]))
     if meta.get("input"):

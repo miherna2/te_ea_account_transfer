@@ -4,14 +4,17 @@ Moves ThousandEyes Enterprise Agents (TEVA appliances) from one account group to
 
 - **Only the agent moves.** The tests stay in their account group and keep their IDs.
 - The new agent is shared with the same account groups that saw the old one, plus the source group.
-- The new agent gets the same tests as the old one. The old agent is deleted last.
+- The new agent gets the same tests as the old one. The old agent is deleted after verification.
 - The default is a **preview**. Nothing changes until you run it with `--apply`.
-- Nothing to configure: no `.env` file, no environment variables. The tool asks for what it needs.
+- No `.env` file or environment variables are required. The tool asks for what it needs. Existing exported
+  `TE_*` settings are still accepted; `.env` files are not loaded automatically.
 
 Contents: [Quick start](#quick-start) · [How it works](#how-it-works) · [Setup](#setup-once) ·
 [Step by step](#step-by-step) · [What the tool asks](#what-the-tool-asks-you) ·
 [If something stops](#if-something-stops) · [Options](#the-options) · [Examples](#examples) ·
 [Troubleshooting](#troubleshooting) · [Security](#security-and-what-is-saved-on-disk)
+
+The [operations runbook](docs/OPERATIONS.md) covers preparation, recovery, and post-migration checks.
 
 ## Quick start
 
@@ -62,13 +65,17 @@ flowchart LR
     D --> E["5. Share B with the same groups<br/>(100, 300 ...)"]
     E --> F["6. Give B the tests that A had"]
     F --> G["7. Point agent-to-agent tests<br/>at B"]
-    G --> H["8. Delete the old agent A<br/>(always last)"]
+    G --> H["8. Verify, then delete<br/>the old agent A"]
     H --> I["9. Name and tags<br/>restored"]
 ```
 
-If any step fails the tool stops, prints the state of that device, and leaves the old agent A alone. A is
-deleted only after B is online, shared, and has the tests (the tool counts them and retries until they
-are all there).
+The tool stops at the first failure and prints the device state. Before deleting A it verifies that B is
+online, shared with every required group, has all expected tests, and has the required agent-to-agent
+targets. Assignment uses batches of at most 10 and retries missing tests for up to three rounds.
+Saved enabled/disabled states must be preserved; a regression stops completion for manual correction.
+Name and tag restoration follows deletion. A rename failure stops the run even though A has already been
+deleted. Tag-restoration failures remain warnings and can accompany a successful exit: inspect them and
+finish the listed tags manually.
 
 ### The run, from your side
 
@@ -94,8 +101,8 @@ flowchart TD
     GO -- y --> RUN["Move the devices one at a time<br/>reports in work/apply/date-time"]
 ```
 
-The pre-reset check happens **before** the first reset, so a wrong password or a blocked port stops the
-run while nothing has been changed.
+The pre-reset check happens **before** the first new migration reset. Completing an earlier interrupted
+migration has its own confirmation and can change that device before the new-migration checks.
 
 ### Name and IP must match (protects you from moving the wrong device)
 
@@ -113,6 +120,8 @@ run while nothing has been changed.
 You never list the groups that must keep seeing the agent. The tool reads them from the old agent and
 shares the new agent with the same ones, with the source group, and with the destination group. The
 destination group becomes the **owner** of the new agent.
+The tool can discover only what the token and returned API metadata expose. Compare the preview with the
+known sharing groups; a group invisible to the token cannot be assumed to have no dependencies.
 
 An agent that you see in the source group is either **owned** by that group or only **shared** with it.
 The ThousandEyes API does not tell which. This matters because the move deletes the old agent:
@@ -144,20 +153,28 @@ Most tests only run **from** an agent, so they keep working after the move. An a
 also uses an agent as its **target**. The new agent has a new ID, so the tool changes the target of those
 tests to the new agent by itself (step 7 above). The preview tells you how many there are.
 
+Voice tests can also use an agent as a target. Those dependencies block the migration for manual handling;
+the tool does not rewrite Voice tests.
+Tests pinned to an explicit source interface on the selected agent also block automatic migration. Normal
+test assignment does not preserve that per-agent `sourceIpAddress` setting; those tests require a qualified
+manual procedure.
+
 ### Standalone agents and clusters
 
 | | Standalone agent | Cluster |
 |---|---|---|
 | Inventory line | name and IP | name only (no IP) |
 | What moves | the agent | the cluster is taken apart and built again in the destination |
-| Maintenance window | no | **yes**: while it moves, the tests that run on the cluster have no agent |
-| Tests that were enabled | stay enabled | may be disabled by ThousandEyes; the tool prints them as a manual list |
+| Maintenance window | allow for the appliance reset and registration | **yes**: while it moves, the tests that run on the cluster have no agent |
+| Tests that were enabled | checked again before old-agent deletion | may be disabled by ThousandEyes; the tool prints them as a manual list |
 
 The tool decides by itself: a line with an IP is a standalone agent; a line without one is looked up as a
 cluster. A cluster is never deleted: only its old member agents are, and only after the new cluster works.
 The option `--auto-reenable-tests` turns the disabled tests back on after a cluster move; leave it out if
 some tests hold masked secrets (the tool then prints the list and you enable them by hand). A cluster that
 stops half way is **not** finished automatically: the output says what was done and what is left.
+Clusters remain outside this project's current production scope. Their old member records are deleted
+only after their identity, membership, and offline state have been checked.
 
 ## Setup (once)
 
@@ -170,7 +187,8 @@ to do it by hand, use the commands below. To remove the libraries later, delete 
 
 - Python 3.6 or newer, built with OpenSSL 1.1.1 or newer (TLS 1.3). Python 3.8 or newer is recommended.
 - The computer that runs the tool must reach each agent on TCP 443 and `api.thousandeyes.com`.
-- A ThousandEyes API v7 token that can see both the source and the destination account groups.
+- A ThousandEyes API v7 token that can read the source, destination, and all sharing groups, with write
+  access for the groups whose agents or tests must be updated.
 
 ### macOS
 
@@ -277,33 +295,36 @@ python3 -m te_agent_migrate --apply        # Windows: python -m te_agent_migrate
 
 The tool uses the last preview as a guide. If the inventory or the account groups changed since then, or
 there is no preview, it says so, shows the new plan and asks you again. It asks you to confirm that the
-source group owns the devices, checks every agent UI (port 443 and login), and asks the last question:
-`Begin destructive migration actions? (y/n)`. Then it moves the devices one at a time.
+source group owns the devices, checks every agent UI (port 443 and login), and asks the last question for
+new migrations: `Begin destructive migration actions? (y/n)`. Then it moves the devices one at a time.
+For a strict requirement to use a particular clean preview, see the optional
+`--confirmed-dry-run-file` workflow in the [runbook](docs/OPERATIONS.md#strict-preview-compatibility).
 
 **Apply resets the real agent. A reset cannot be undone.** Do not press Ctrl-C or close the window during a
 device. The tool stops at the first failure and prints the state of that device. It never changes an
-offline device. A device that was moved is remembered (`work/state/migrated.json`), so running the tool
+offline appliance during a new migration. A device that was moved is remembered (`work/state/migrated.json`), so running the tool
 again skips it.
 
 ### 4. After the move
 
 - Recreate the agent notification rules by hand. The API cannot write them.
 - Dashboards that filter on a specific agent ID must point to the new agent.
+- Review tag-restoration warnings even when the run exits successfully; those tags still need manual work.
 - Cluster moves: enable by hand the tests that the tool listed (unless you used `--auto-reenable-tests`).
 
 ## What the tool asks you
 
 | Question | When | Notes |
 |---|---|---|
-| ThousandEyes API v7 token | always | hidden; checked at once; 3 tries; the message says how many characters were received |
+| ThousandEyes API v7 token | unless exported | hidden; checked at once; 3 tries for prompted input; the message says how many characters were received |
 | `name ip` lines | only if the inventory file does not exist | saved to `work/input/inventory.csv` |
-| `Use it? [Y/n]` for the source group | always | the tool found the group that sees all your devices. `n` shows the full list of groups |
+| `Use it? [Y/n]` for the source group | unless `TE_SOURCE_AID` is exported | the tool found the group that sees all your devices. `n` shows the full list of groups |
 | Destination group | only if a device has no `target` and no prefix-map match | one question for the run; the source group is not offered |
 | Is the source group the owner of ALL these devices? | `--apply`, only for devices where the owner is assumed | answer `n` if unsure |
 | Agent UI user and password | `--apply` | hidden; checked on every device before the first reset; 3 tries |
 | Registration token of each destination group | `--apply` | the "Account Group Token" in the ThousandEyes UI (Add New Enterprise Agent); once per destination; hidden; 3 tries |
 | Finish N interrupted migration(s)? | `--apply`, only if an earlier run stopped | see below |
-| `Begin destructive migration actions? (y/n)` | `--apply` | the last question before anything changes |
+| `Begin destructive migration actions? (y/n)` | `--apply` | the last question before new migration resets; recovery has its own confirmation |
 
 Secrets are never printed and never written to disk.
 
@@ -318,7 +339,7 @@ A timeout, a closed window or a network drop can stop a run after the new agent 
 flowchart TD
     R["Run again"] --> S{"Snapshot of the old agent<br/>in work/apply or work/runs?"}
     S -- no --> N["Normal run"]
-    S -- yes --> O{"Old agent offline or gone,<br/>and a new agent with the same IP<br/>in the destination group?"}
+    S -- yes --> O{"Snapshot matches the selected device<br/>and source/destination;<br/>one matching new agent online?"}
     O -- no --> N
     O -- yes --> L["List what is left:<br/>share, tests, delete old agent, rename, tags"]
     L --> P{"--apply?"}
@@ -328,10 +349,18 @@ flowchart TD
     Q -- n --> N
 ```
 
-It only does what is missing, so you can run it as many times as you need. It adds tests and shares; it
-never removes them. It deletes the old agent only if it is offline and standalone. It needs the snapshot
-that the earlier run saved in `work/apply` (or `work/runs`): do not delete those folders while you
-may still need them.
+Recovery uses the current inventory and source/destination selection. It requires a matching snapshot,
+device identity, and one online replacement; an IP address alone is insufficient. It preserves existing
+live shares and adds missing shares and tests. The old standalone agent must be verified offline before
+deletion. A mismatch, ambiguous candidate, invalid test state, or failed check requires manual handling.
+Keep the snapshots in `work/apply` (or older `work/runs`) until recovery and post-migration checks are done.
+Older snapshots without saved enabled states produce a manual-verification warning: compare those tests
+with the operator's before-state, because the tool cannot prove their original enabled state.
+If an older snapshot omitted per-agent source-interface settings and the old record is gone, compare the
+test configuration with the operator's before-state; automatic recovery cannot reconstruct that binding.
+
+An offline old entry plus a new entry with a temporary name can indicate an interrupted migration.
+Check every group's sharing and test membership before any manual deletion.
 
 ### A device is blocked in the preview
 
@@ -361,6 +390,8 @@ again. See [Troubleshooting](#troubleshooting).
 
 Older options (`--dry-run`, `--owner-is-source`, `--repoint-agent-to-agent`) are still accepted and do
 nothing: the tool does it by itself.
+`--output DIR` and `--confirmed-dry-run-file FILE` remain compatibility options; see the
+[runbook](docs/OPERATIONS.md#strict-preview-compatibility).
 
 ## Examples
 
@@ -422,8 +453,9 @@ flowchart TD
 - **No secrets on disk.** The API token, the registration tokens and the agent UI password are asked with a
   hidden prompt and kept in memory only. They are never printed in the output or the reports.
 - **Inventory columns that look like secrets** (`password`, `token`, `secret` ...) are refused.
-- **Certificates:** the tool does not ship or store any certificate. The agent UI and the API are reached
-  with the normal certificate checks of your Python. To check a certificate yourself:
+- **Certificates:** ThousandEyes API requests use certificate verification. Appliance UI requests
+  currently use `verify=False`, so those HTTPS connections do not verify the appliance's identity.
+  The tool does not ship a certificate. To inspect a certificate yourself:
   `openssl x509 -text -noout -in <file>`.
 - **Saved files:** the inventory, the optional prefix map, the reports, the snapshots (device settings and
   test ids, no secrets) and `work/state/migrated.json`. Delete `work/apply` only when you no longer need to

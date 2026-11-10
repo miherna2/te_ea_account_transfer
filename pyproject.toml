@@ -1,0 +1,52 @@
+[project]
+name = "te-agent-migrate"
+version = "0.1.0"
+description = "Migrate ThousandEyes Enterprise Agents with the minimal-requirements implementation."
+readme = "TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/README.md"
+requires-python = ">=3.11"
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "requests==2.27.1",
+  "urllib3==1.26.16",
+]
+
+[project.optional-dependencies]
+xlsx = ["openpyxl>=3.1.5"]
+
+[project.scripts]
+te-agent-migrate = "te_agent_migrate.cli:main"
+te-report = "te_report.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/te_agent_migrate",
+  "TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/te_report",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/README.md",
+  "/AGENTS.md",
+  "/.gitignore",
+  "/pyproject.toml",
+  "/run.sh",
+  "/run.ps1",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/README.md",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/.gitignore",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/requirements.txt",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/te_agent_migrate",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/te_report",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/docs/OPERATIONS.md",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/examples/inventory.example.csv",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/examples/prefix_map.example.csv",
+  "/TE_AGENT_MIGRATE_MINIMAL_REQUIREMENTS/tools/te_discovery.sh",
+]

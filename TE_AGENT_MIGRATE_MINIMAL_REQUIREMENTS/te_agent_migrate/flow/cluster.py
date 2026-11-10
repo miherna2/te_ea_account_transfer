@@ -444,24 +444,41 @@ def _snapshot_summary(snap):
 
 
 # --------------------------------------------------------------------------- steps
-def _map_old_members(item, records, exclude_ids=()):
-    """Map each old member to its standalone agent id by IP. Returns {memberId: agent id or None}.
+def _member_record_matches(member, record):
+    """Require the member IP and a name/hostname or an explicit agentId witness.
 
-    Never trusts memberId == agent id. Clusters are never candidates. When several records share the
-    IP, the one with the member name wins, then the one whose id equals the member id; otherwise the
-    member stays unmapped (None).
+    A cluster memberId can differ from its standalone agent id, so equality of those fields alone
+    cannot identify a record for deletion. Private IP addresses can also repeat across sites.
+    """
+    if record.is_cluster or _member_ip(member) not in record.ip_addresses:
+        return False
+    name = str(member.get('name') or member.get('agentName') or '').strip().casefold()
+    named = bool(name) and name in ((record.name or '').strip().casefold(),
+                                   (record.hostname or '').strip().casefold())
+    agent_id = member.get('agentId')
+    identified = (agent_id is not None and not isinstance(agent_id, (bool, dict, list, tuple))
+                  and str(agent_id).strip() == str(record.agent_id))
+    return named or identified
+
+
+def _map_old_members(item, records, exclude_ids=()):
+    """Map old members only when IP plus name/hostname or explicit agentId agree.
+
+    Returns {memberId: agent id or None}. Delayed or ambiguous records stay unmapped instead of
+    selecting an unrelated agent that happens to use the same private IP.
     """
     mapping, used = {}, set()
     for member in item.members:
-        mid, ip, name = _member_id(member), _member_ip(member), _member_name(member).casefold()
+        mid, name = _member_id(member), _member_name(member).strip().casefold()
         found = [r for r in records if not r.is_cluster and r.agent_id not in exclude_ids
-                 and r.agent_id not in used and ip in r.ip_addresses]
+                 and r.agent_id not in used and _member_record_matches(member, r)]
         if len(found) > 1:
-            named = [r for r in found if name in ((r.name or '').casefold(), (r.hostname or '').casefold())]
+            named = [r for r in found if name in ((r.name or '').strip().casefold(),
+                                                 (r.hostname or '').strip().casefold())]
             if len(named) == 1:
                 found = named
             else:
-                same_id = [r for r in found if r.agent_id == mid]
+                same_id = [r for r in found if str(r.agent_id) == str(member.get('agentId', ''))]
                 found = same_id if len(same_id) == 1 else found
         mapping[mid] = found[0].agent_id if len(found) == 1 else None
         if mapping[mid]:
@@ -962,6 +979,23 @@ def _delete_old(ctx, item, host, progress, new_ids, new_cluster_id, warnings=Non
                           % ('same id as a new agent' if same_as_new and not unmapped
                              else 'none could be mapped to a standalone agent id'))
             return
+        # Revalidate every mapped identity before the first delete. The earlier listing can be stale,
+        # and a live agent must never be removed just because it once matched a member's IP.
+        for old_id in targets:
+            record = present.get(old_id)
+            if record is None:
+                continue
+            if record.is_cluster:
+                raise FlowAborted('refusing to delete id %s in aid %s: it is a cluster, and deleting a cluster '
+                                  'deletes its members; delete the old members by hand' % (old_id, owner))
+            members = [m for m in item.members if mapping.get(_member_id(m)) == old_id]
+            if not members or not all(_member_record_matches(member, record) for member in members):
+                raise FlowAborted('identity of mapped old member agent %s in aid %s no longer agrees with the '
+                                  'saved member IP and name or agentId; old members were NOT deleted'
+                                  % (old_id, owner))
+            if str(record.state or '').strip().lower() != 'offline':
+                raise FlowAborted('mapped old member agent %s in aid %s is not offline (state %s); old members '
+                                  'were NOT deleted' % (old_id, owner, record.state or 'unknown'))
         done = []
         for old_id in targets:
             record = present.get(old_id)

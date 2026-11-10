@@ -1,6 +1,7 @@
 """ThousandEyes API v7 client using the approved Requests dependency."""
 
 import json
+import re
 import time
 from threading import RLock
 from urllib.parse import urljoin
@@ -53,6 +54,33 @@ RESPONSE_ONLY_FIELDS = frozenset({
     'modifiedDate', 'modifiedAt', 'savedEvent', 'sslVersion', 'testId', 'testResults', 'testType',
     'type', 'versionId',
 })  # fields of a test GET that a PUT must not send back
+
+
+def _contains_masked_secret(value, sensitive=False):
+    """Recognize placeholders under secret fields without reporting their values."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            name = str(key).casefold().replace('_', '').replace('-', '')
+            secret_field = any(part in name for part in (
+                'password', 'passwd', 'secret', 'token', 'authorization', 'cookie',
+                'credentials', 'headers', 'oauth', 'transactionscript', 'privatekey', 'clientcertificate',
+            ))
+            if _contains_masked_secret(child, sensitive or secret_field):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_masked_secret(child, sensitive) for child in value)
+    elif sensitive and isinstance(value, str):
+        text = value.strip().casefold()
+        # Headers, OAuth form bodies and scripts can embed a masked value in a larger string.
+        # Split only at value separators so ordinary glob patterns and partial words stay intact.
+        candidates = [text] + [part.strip('"\'(){}') for part in re.split(r'[\s=:;&,]+', text)]
+        return any(
+            candidate in ('[redacted]', '<redacted>', 'redacted', '[masked]', '<masked>', 'masked')
+            or (len(candidate) >= 3 and set(candidate) <= set('*\u2022'))
+            or (len(candidate) >= 4 and set(candidate) == set('x'))
+            for candidate in candidates
+        )
+    return False
 
 
 class AmbiguousAgentMatch(ApiError):
@@ -240,7 +268,7 @@ class ThousandEyesApiClient(object):
             for item in self._paginate("account-groups", "accountGroups")
         ]
 
-    def list_agents(self, aid, agent_types="ENTERPRISE"):
+    def list_agents(self, aid, agent_types="enterprise"):
         params = {"agentTypes": agent_types, "expand": "test-ids"}
         return [
             AgentRecord.from_api(item, aid)
@@ -631,6 +659,25 @@ class ThousandEyesApiClient(object):
                 values.add(str(value))
         return values
 
+    @staticmethod
+    def _test_agent_assignments(test):
+        """Writable agent assignment fields, including an explicitly selected source interface."""
+        assignments = {}
+        for agent in test.agents:
+            value = agent.get("agentId", agent.get("id")) if isinstance(agent, dict) else agent
+            agent_id = ThousandEyesApiClient._scalar_id(value)
+            if agent_id is None:
+                raise ApiError("Test %s has an unreadable source agent id; nothing written" % test.test_id)
+            assignment = {"agentId": agent_id}
+            if isinstance(agent, dict) and agent.get("sourceIpAddress") is not None:
+                if not isinstance(agent["sourceIpAddress"], str):
+                    raise ApiError("Test %s has an invalid source interface setting" % test.test_id)
+                assignment["sourceIpAddress"] = agent["sourceIpAddress"]
+            if agent_id in assignments and assignments[agent_id] != assignment:
+                raise ApiError("Test %s has conflicting source interface settings" % test.test_id)
+            assignments[agent_id] = assignment
+        return [assignments[agent_id] for agent_id in sorted(assignments)]
+
     def delete_agent(self, aid, agent_id, agent_type=None):
         if str(agent_type or "").casefold() == CLUSTER_AGENT_TYPE:
             raise ApiError(
@@ -669,12 +716,16 @@ class ThousandEyesApiClient(object):
         """Build the body of a full-payload PUT from a test read with ``get_test``.
 
         Response-only fields are dropped. Expanded objects (agents, tags, alert
-        rules, monitors, shared accounts) are reduced to the id forms a PUT accepts.
+        rules, monitors, shared accounts) are reduced to the forms a PUT accepts;
+        source interface selections remain attached to their agent ids.
         The caller changes the one field it wants to change and sends the result with ``update_test``.
         Shared by ``set_test_enabled`` and ``set_agent_to_agent_target``.
         """
         from copy import deepcopy
 
+        if _contains_masked_secret(test.raw):
+            raise ApiError("Test %s contains masked secret fields; update it manually instead of a full PUT"
+                           % test.test_id)
         payload = deepcopy(test.raw)
         for field in RESPONSE_ONLY_FIELDS:
             payload.pop(field, None)
@@ -691,9 +742,9 @@ class ThousandEyesApiClient(object):
             return result
 
         payload.pop("agents", None)
-        agent_ids = sorted(self._test_agent_ids(test))
-        if agent_ids:
-            payload["agents"] = [{"agentId": value} for value in agent_ids]
+        assignments = self._test_agent_assignments(test)
+        if assignments:
+            payload["agents"] = assignments
         if "alertRules" in payload:
             payload["alertRules"] = ids_of(payload["alertRules"], "ruleId", "id")
         if "tags" in payload:
@@ -744,8 +795,8 @@ class ThousandEyesApiClient(object):
            nothing written).
         4. PUT the full payload (same builder and same PUT as ``set_test_enabled``: response-only fields
            dropped, expanded objects reduced to ids, 429-only write retry) with only ``targetAgentId`` changed.
-        5. GET again. ``targetAgentId`` must be the new id, and ``enabled`` and the source agent ids must be
-           the same as before the PUT, else ``ApiError``. Return ``'changed'``.
+        5. GET again. ``targetAgentId`` must be the new id, and ``enabled``, source agent ids and source
+           interface selections must be the same as before the PUT, else ``ApiError``. Return ``'changed'``.
 
         Messages carry ids only, never payload values.
         """
@@ -779,8 +830,9 @@ class ThousandEyesApiClient(object):
             )
         if bool(after.raw.get("enabled", True)) != bool(before.raw.get("enabled", True)):
             raise ApiError("a2a test %s in aid %s: the enabled flag changed during the PUT" % (test_id, aid))
-        if self._test_agent_ids(after) != self._test_agent_ids(before):
-            raise ApiError("a2a test %s in aid %s: the source agent list changed during the PUT" % (test_id, aid))
+        if self._test_agent_assignments(after) != self._test_agent_assignments(before):
+            raise ApiError("a2a test %s in aid %s: the source agent list or interface selections changed during the PUT"
+                           % (test_id, aid))
         return "changed"
 
     @staticmethod

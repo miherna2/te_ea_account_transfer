@@ -1,0 +1,59 @@
+# Credentials and local configuration
+.env
+.env.*
+
+# Lab-specific inventory and generated reports
+inventory.csv
+reports/
+work/
+/out/
+
+# Local-only engineering material; see AGENTS.md before staging or publishing.
+/pyproject.local.toml
+/dev/
+/docs/
+/architecture/
+/labs/
+/sandbox/
+/ARCHITECTURE*.md
+/DESIGN*.md
+/TEST*.md
+/LAB*.md
+.omx/
+*.log
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and build artifacts
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Symlinked virtual environment
+.venv
+
+# Keep current entrypoints reviewable despite older checkout-local excludes.
+!/.gitignore
+!/AGENTS.md
+!/pyproject.toml
+!/run.sh
+!/run.ps1
+
+# The legacy src/, tests/ and uv.lock are not the minimal implementation.
+/src/
+/tests/
+/uv.lock

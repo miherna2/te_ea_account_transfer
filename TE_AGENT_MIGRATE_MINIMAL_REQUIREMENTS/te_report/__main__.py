@@ -8,7 +8,7 @@ import sys
 
 from te_report.graph import build_graph
 from te_report.impact import flag_impact, resolve_selection, summarize
-from te_report.loader import load_discovery, load_selection
+from te_report.loader import DiscoveryInputError, load_discovery, load_selection
 from te_report.outputs import write_all
 
 
@@ -27,13 +27,29 @@ def build_parser():
 
 def main(argv=None, out=None):
     out = out or sys.stdout
+    try:
+        return _run(argv, out)
+    except DiscoveryInputError as exc:
+        out.write("ERROR: %s\n" % exc)
+    except Exception as exc:
+        # Filesystem and malformed-data exceptions may include secret payloads.
+        out.write("ERROR: could not complete the report (%s)\n" % type(exc).__name__)
+    return 1
+
+
+def _run(argv, out):
     args = build_parser().parse_args(argv)
 
     def say(text):
         out.write(text + "\n")
 
     data = load_discovery(args.input)
+    if not data["usable"]:
+        say("ERROR: no usable agents.json or tests.json datasets; no report written")
+        return 1
     graph = build_graph(data)
+    for key in ("complete", "required_missing", "required_errors"):
+        graph.meta[key] = data[key]
     stats = graph.stats()
     say("Discovery: %s" % args.input)
     say(
@@ -46,10 +62,18 @@ def main(argv=None, out=None):
             stats.get("global_filter", 0), stats.get("suppression", 0), len(graph.edges),
         )
     )
-    if data["missing"]:
-        say("Missing optional files: %d" % len(data["missing"]))
-    if data["errors"]:
-        say("Unreadable files: %d" % len(data["errors"]))
+    optional_missing = [rel for rel in data["missing"] if rel not in data["required_missing"]]
+    optional_errors = [rel for rel in data["errors"] if rel not in data["required_errors"]]
+    if not data["complete"]:
+        say("WARNING: INCOMPLETE discovery; impact findings cannot establish complete coverage")
+        for rel in data["required_missing"]:
+            say("  missing required file: %s" % rel)
+        for rel in data["required_errors"]:
+            say("  unreadable or invalid required file: %s" % rel)
+    if optional_missing:
+        say("Missing optional files: %d" % len(optional_missing))
+    if optional_errors:
+        say("Unreadable optional files: %d" % len(optional_errors))
 
     resolution = None
     findings = None
@@ -87,10 +111,13 @@ def main(argv=None, out=None):
         "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "input": args.input,
         "selection_count": len(selection) if args.selection else None,
-        "missing": data["missing"],
-        "errors": data["errors"],
+        "missing": optional_missing,
+        "errors": optional_errors,
+        "complete": data["complete"],
+        "required_missing": data["required_missing"],
+        "required_errors": data["required_errors"],
     }
-    status = 0
+    status = 0 if data["complete"] else 1
     if findings is not None:
         from te_report import dashboard_view
         from te_report.render_dashboards import render as render_dashboards

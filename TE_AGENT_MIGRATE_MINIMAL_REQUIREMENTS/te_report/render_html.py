@@ -546,6 +546,11 @@ class _Page(object):
             card(label, stats.get(kind, 0))
         card("relationships", len(g.edges))
         out = ['<h2 id="summary">1. Summary</h2><div class="cards">%s</div>' % "".join(cards)]
+        if self.meta.get("complete") is False:
+            out.insert(0, '<p role="alert"><strong>INCOMPLETE discovery: required agent/test data is missing '
+                       'or unreadable. Impact findings cannot establish complete coverage.</strong></p>')
+            gaps = (self.meta.get("required_missing") or []) + (self.meta.get("required_errors") or [])
+            out.append('<p>Required discovery gaps: %s</p>' % esc(", ".join(gaps)))
         if self.sel is not None:
             sel = self.sel
             tokens = self.meta.get("selection_count")
@@ -746,6 +751,6 @@ def render(graph, findings, selection, meta):
     ``selection`` is the dict from ``resolve_selection`` (or None for an
     inventory-only report); ``findings`` is the list from ``flag_impact``.
     ``meta`` may hold ``generated``, ``input``, ``selection_count``,
-    ``missing`` and ``errors``.
+    ``missing``, ``errors``, ``complete``, ``required_missing`` and ``required_errors``.
     """
     return _Page(graph, findings, selection, meta).build()
