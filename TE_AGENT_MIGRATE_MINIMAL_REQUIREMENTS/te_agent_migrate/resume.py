@@ -4,12 +4,11 @@ Before a device is reset the tool saves a snapshot of it (tests, groups, tags). 
 new agent came online, the snapshot and the live data say what is left:
 
 * the new agent is in the destination group (same IP, a different id than the old one),
-* and something is missing: a share, a test, the old agent is still there, the name or a tag is not restored.
+* and something is missing: a share, a test, old-agent retirement, the name or a tag.
 
 The next run finds this by itself, tells the operator, and in ``--apply`` finishes it after one question.
 Every step reads first and only does what is missing, so running it twice is safe. It adds tests, it never
-removes one, and it deletes the old agent only when that agent is a standalone agent, is offline and is the
-device of the snapshot.
+removes one. It disables and marks the verified old registration instead of deleting it.
 """
 import ipaddress
 import json
@@ -19,8 +18,8 @@ from te_agent_migrate.errors import ApiError
 from te_agent_migrate.flow.context import FlowAborted, FlowResult, PreflightItem
 from te_agent_migrate.flow.preflight import source_interface_problem
 from te_agent_migrate.flow.standalone import (
-    _State, _assign_tests, _delete_old, _desired_groups, _rename, _repoint_a2a, _restore_tags, _share_back,
-    _verify_enabled,
+    _State, _assign_tests, _retire_old, _desired_groups, _rename, _repoint_a2a, _restore_tags, _share_back,
+    _verify_enabled, _retirement_complete, retired_agent_name,
 )
 from te_agent_migrate.models import InventoryAgent
 
@@ -127,10 +126,19 @@ def snapshot_files(work_dir):
     return [path for _, path in sorted(found, reverse=True)]
 
 
-def load_snapshots(work_dir):
+def load_snapshots(work_dir, snapshot_dir=None):
     """{old agent id: (path, data)}, newest first. Damaged saved recovery state blocks a new reset."""
     out = {}
-    for path in snapshot_files(work_dir):
+    try:
+        paths = snapshot_files(work_dir)
+        if snapshot_dir is not None and os.path.isdir(str(snapshot_dir)):
+            paths.extend(os.path.join(str(snapshot_dir), name) for name in os.listdir(str(snapshot_dir))
+                         if name.endswith('.json'))
+        paths = sorted(set(os.path.abspath(path) for path in paths), key=os.path.getmtime, reverse=True)
+    except OSError as exc:
+        raise FlowAborted('cannot inspect saved recovery state (%s); no new migration is allowed'
+                          % type(exc).__name__)
+    for path in paths:
         try:
             with open(path, encoding='utf-8') as handle:
                 data = json.load(handle)
@@ -181,6 +189,17 @@ def _identity_matches(record, snap, ip):
                                           inventory.get('hostname')) if _scalar(value))
     return (not record.is_cluster and _ip(ip) in _ips(record)
             and bool(names & set([_norm(record.name), _norm(record.hostname)])))
+
+
+def _old_identity_matches(record, snap, ip):
+    old_id = str(snap['record']['agent_id'])
+    if str(record.agent_id) != old_id:
+        return False
+    if _identity_matches(record, snap, ip):
+        return True
+    return (not record.is_cluster and str(record.agent_type or '').casefold() == 'enterprise'
+            and record.raw.get('enabled') is False and record.name == retired_agent_name(old_id)
+            and _ip(ip) in _ips(record) and _ip(ip) in set(_ip(value) for value in snap['record']['ip_addresses']))
 
 
 def _live_shares(record, target, label='new'):
@@ -291,7 +310,7 @@ def find_interrupted(api, source_aid, agents, snapshots, console=None, target_ai
                                      and ip in set(_ip(i) for i in recorded_ips))
             if not relevant:
                 continue
-            if old_record is not None and old_record.online:
+            if old_record is not None and old_record.online and snap.get('replacement') is None:
                 continue  # this saved snapshot never reached a reset
             problem = _snapshot_problem(snap, old_id)
             if problem:
@@ -303,9 +322,8 @@ def find_interrupted(api, source_aid, agents, snapshots, console=None, target_ai
                 _refuse(agent.hostname, path, 'snapshot destination differs from the selected destination')
             if agent.agent_id and str(agent.agent_id) != str(old_id):
                 _refuse(agent.hostname, path, 'inventory agent_id differs from the snapshot old agent id')
-            if old_record is not None and (old_record.is_cluster or _norm(old_record.state) != 'offline'
-                                           or not _identity_matches(old_record, snap, ip)):
-                _refuse(agent.hostname, path, 'old agent identity or offline state could not be verified')
+            if old_record is not None and (old_record.is_cluster or not _old_identity_matches(old_record, snap, ip)):
+                _refuse(agent.hostname, path, 'old agent identity could not be verified')
             candidates.append((str(old_id), old_record, path, snap))
         if not candidates:
             continue
@@ -338,7 +356,7 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
         target_cache[target] = api.list_agents(target)
     same_ip = [r for r in target_cache[target] if str(r.agent_id) != old_id and ip in _ips(r)]
     news = [r for r in same_ip if _replacement_matches(r, snap, ip)]
-    if not news and not same_ip and old_record is not None:
+    if not news and not same_ip and old_record is not None and snap.get('replacement') is None:
         return None
     if not news:
         _refuse(snap['name'], path, 'new agent identity could not be verified in the destination')
@@ -353,6 +371,8 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
     detail = api.get_agent(target, new_id)
     if str(detail.agent_id) != new_id or not _replacement_matches(detail, snap, ip):
         _refuse(snap['name'], path, 'new agent detail does not match its recorded identity')
+    if not detail.online or detail.raw.get('enabled') is not True:
+        pending.append('replacement must be online and enabled')
     groups = [g for g in _desired_groups(_item_from_snapshot(snap, old_record, wanted, []), target)]
     have = _live_shares(detail, target)
     if [g for g in groups if g not in have]:
@@ -368,8 +388,9 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
         pending.append('%d agent-to-agent target(s) to repair' % len(dependencies))
     if _enabled_needs_review(api, snap):
         pending.append('saved test enabled/disabled state needs manual review')
-    if old_record is not None:
-        pending.append('delete the old agent %s' % old_id)
+    if old_record is not None and not _retirement_complete(api, str(snap['source_aid']), old_record):
+        pending.append('finish old agent %s retirement: disabled, tagged and named %s (keep its registration)'
+                       % (old_id, retired_agent_name(old_id)))
     if _norm(detail.name) != _norm(snap['name']):
         pending.append('rename to %s' % snap['name'])
     tags = []
@@ -471,10 +492,11 @@ def _verify_source_interfaces(api, item, old_id):
 
 def _read_old(api, snap, old_id, ip):
     old = api.get_agent(snap['source_aid'], old_id)
-    if str(old.agent_id) != str(old_id) or not _identity_matches(old, snap, ip):
-        raise FlowAborted('old agent identity changed; recovery stopped without deleting it')
-    if _norm(old.state) != 'offline':
-        raise FlowAborted('old agent %s is %s; recovery stopped without deleting it' % (old.agent_id, old.state))
+    if (str(old.agent_id) != str(old_id) or str(old.agent_type or '').casefold() != 'enterprise'
+            or not _old_identity_matches(old, snap, ip)):
+        raise FlowAborted('old agent identity changed; recovery stopped without changing it')
+    if old.online and snap.get('replacement') is None:
+        raise FlowAborted('online old agent requires a saved replacement checkpoint; recovery stopped')
     return old
 
 
@@ -496,8 +518,8 @@ def resume_device(ctx, interrupted):
     current = ctx.api.get_agent(ctx.target_aid, new_id)
     if str(current.agent_id) != str(new_id) or not _replacement_matches(current, interrupted.snapshot, item.ui_ip):
         raise FlowAborted('new agent identity changed; no recovery changes were made')
-    if not current.online:
-        raise FlowAborted('new agent %s is %s, not online; nothing was changed. Start the agent and run again'
+    if not current.online or current.raw.get('enabled') is not True:
+        raise FlowAborted('new agent %s is %s, not confirmed online and enabled; nothing was changed'
                           % (new_id, current.state))
     have = _live_shares(current, ctx.target_aid)
     old_record = _check_old(ctx, interrupted)
@@ -523,9 +545,12 @@ def resume_device(ctx, interrupted):
     _verify_enabled(ctx, item, new_id)
     if interrupted.old_record is not None:
         _check_old(ctx, interrupted)
-        _delete_old(ctx, item, old_id, new_id, state)
+        _retire_old(ctx, item, old_id, new_id, state)
     _rename(ctx, item, new_id)
     _restore_tags(ctx, item, new_id, warnings)
     _verify_enabled(ctx, item, new_id)
-    return FlowResult(item.name, True, 'finished an earlier run: new agent %s' % new_id, new_agent_id=new_id,
+    detail = 'finished an earlier run: new agent %s' % new_id
+    if interrupted.old_record is not None:
+        detail += '; old registration retained disabled and marked for manual deletion'
+    return FlowResult(item.name, True, detail, new_agent_id=new_id,
                       warnings=warnings, snapshot=interrupted.path)

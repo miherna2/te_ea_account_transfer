@@ -77,7 +77,9 @@ migration: normal assignment does not preserve its per-agent `sourceIpAddress`. 
 qualified manual procedure. A source group's visibility alone does not establish ownership.
 Compare discovered groups with the known sharing list: groups hidden from both the token and returned API
 metadata cannot be proven dependency-free by an empty scan.
-Missing or malformed assignment data is a blocker, not proof of zero tests.
+When an agent list omits assignment fields, the tool requests expanded test IDs from that agent's
+detail endpoint in the same group. Only a matching ID and an explicit valid list establish its assignments.
+Unresolved or malformed assignment data remains a blocker, not proof of zero tests.
 
 ## 4. Apply
 
@@ -95,6 +97,7 @@ The default workflow can proceed from that fresh confirmed plan if the earlier p
 changed; it reports the difference. For a mandatory matching saved preview, use the strict option below.
 All required group tokens must be available before the first new-migration reset. A token format check
 cannot prove that it belongs to the intended group; wrong-group registration detection stops the flow.
+The API token also needs source-group agent and tag-management permissions for retirement.
 
 **Apply resets real appliances; a reset cannot be undone.** Allow for reset and registration downtime.
 Do not close the terminal or interrupt a device deliberately. Devices run one at a time; a failure stops
@@ -102,10 +105,18 @@ the batch. Reports go to `work/apply/<date-time>`. Keep the reported old/new IDs
 The tool checks the approved plan again after confirmation and before each device starts.
 Changed assignments, enabled states, shares or target dependencies stop the affected migration.
 
-Keep sharing, tests and target settings unchanged for the full move. Immediately before deletion, the
-tool reads live dependencies again. It retains the old record if a required share or assignment is missing,
-a target still uses the old ID, or required data is unreadable. The API has no atomic check-and-delete
-operation; concurrent changes after the final read remain a risk.
+Keep sharing, tests and target settings unchanged for the full move. Immediately before disabling the old
+registration, the tool rechecks replacement identity, online status and explicit API `enabled=true`,
+all saved/current shares and assignments,
+target dependencies, and saved test enabled states. Missing or unreadable data stops retirement.
+An old registration still reporting online is not itself a blocker. The tool disables it through the API,
+verifies `enabled=false`, and ensures the tag `migration-status=MIGRATED-TO-BE-DELETED` is assigned.
+It then renames the disabled, marked old record to `MIGRATED-TO-BE-DELETED-<old-id>` and verifies that name.
+This frees the original full name for the active replacement; the retained old record still exists.
+Other existing tags and shares are preserved. No old registration is deleted or force-deleted.
+If disablement, tag or archived-name verification fails, execution stops with the checkpoint intact. Resolve the failure
+and resume; do not reset the appliance again.
+The final reads and writes are not atomic; concurrent configuration changes remain a risk.
 
 ### Strict preview compatibility
 
@@ -113,8 +124,8 @@ operation; concurrent changes after the final read remain a risk.
 supplied `--confirmed-dry-run-file FILE` requires a usable clean preview for the same inventory, groups,
 and current plan before writes. A missing, invalid, used, or mismatched explicit proof refuses apply.
 A matching proof is single-use and is marked `.used` when apply starts.
-Create a new preview after an upgrade. Schema 6 also binds per-group test IDs and enabled states;
-older proofs cannot authorize the new checks.
+Create a new preview after an upgrade. Schema 8 binds retirement and old-name archiving, per-group test IDs
+and enabled states. Schema 7 approvals, schema 6 deletion-era approvals and older proofs are rejected.
 
 ```bash
 python3 -m te_agent_migrate --inventory work/input/inventory.csv --output work/preview-one
@@ -130,46 +141,69 @@ recovery workflow instead of trying to reuse the obsolete strict proof from befo
 
 Compare the snapshot and live UI for every required account group:
 
-- The identified replacement is online in the intended owner group, with the expected name and IP.
+- The identified replacement is online with explicit API `enabled=true` in the intended owner group,
+  with the expected name and IP.
 - Source and all dependent sharing groups see it; no existing replacement share was lost during recovery.
 - Every expected test ID is assigned in its original group. Saved enabled/disabled states are preserved.
 - Supported agent-to-agent targets use the replacement; blocked Voice dependencies are handled manually.
-- The old agent is gone only after the replacement checks pass. Name and tags are restored afterward.
+- The old registration remains with `enabled=false` and `migration-status=MIGRATED-TO-BE-DELETED`;
+  its name is `MIGRATED-TO-BE-DELETED-<old-id>`. Its other tags and shares remain unchanged.
+  The replacement's original full name and tags are restored afterward.
+- There is one active replacement and one disabled marked old record, not one total registration.
 - Agent notification rules and dashboards filtering old agent IDs have their manual follow-up completed.
 
-A rename failure after deletion returns failure. Tag-restoration failures remain nonfatal warnings and can
-accompany a successful exit; inspect the warnings and finish those tags manually. Successful replacement
-alone is not complete metadata restoration. Retain snapshots until all checks are complete.
+A rename failure after retirement returns failure. Replacement tag-restoration failures remain nonfatal
+warnings; inspect them and finish those tags manually. Old-record disablement and its migration-status tag
+must be verified, not treated as optional metadata. Retain snapshots until all checks are complete.
 
 ## 6. If a run stops
 
 A timeout can occur after the API applied a request. Do not infer that its assignments were rejected.
 The current assignment flow sends batches of at most 10, rereads assignments, and retries missing tests
-for up to three rounds. It verifies every group before old-agent deletion. Standalone enabled-state
+for up to three rounds. It verifies every group before old-agent disablement. Standalone enabled-state
 regressions require manual correction; the tool does not send a full test update to re-enable them.
 
+For old-agent disablement or either rename, a transport error or HTTP 5xx can leave the result
+uncertain. The tool uses bounded GET verification without repeating the PUT. Verified `enabled=false`
+or the exact requested name allows it to continue; an unverified result or a known HTTP 4xx stops the run.
+Keep the checkpoint and resolve the failure without another appliance reset.
+
 Run the same preview again with the same current inventory and source/destination choices. Integrated
-recovery reads snapshots under `work/apply` and older `work/runs`; a preview reports its findings without
-writes. Apply offers a separate confirmation to finish a safely identified interrupted standalone move.
-It requires a matching snapshot, current selection, and one online replacement with sufficient device
-identity. An IP match alone, an online old agent, ambiguous replacements, conflicting ownership, or missing
-critical test state does not authorize deletion. Recovery preserves live shares and adds missing tests.
+recovery reads snapshots under `work/apply` and older `work/runs`. For a custom apply output, rerun with
+the same `--output DIR` so recovery also reads `DIR/snapshots`. A preview reports findings without writes.
+Apply offers a separate confirmation to finish a safely identified interrupted standalone move.
+Use ordinary `--apply` recovery, without the old `--confirmed-dry-run-file` or `.used` approval.
+It requires a matching snapshot, current selection, and one online replacement with explicit API
+`enabled=true` and sufficient device
+identity. An IP match alone, ambiguous replacements, conflicting ownership, unreadable identity/dependencies,
+or missing critical test state does not authorize retirement. The old record reporting online is not itself
+a blocker. Recovery preserves live shares and adds missing tests before disabling and marking the old record.
+It verifies the archived old name before restoring the replacement's original full name. Repeating recovery
+reuses the same records and completes only missing work, without another reset.
 After verified registration, the snapshot is updated atomically with the replacement ID, destination and
 observed identity. This checkpoint permits recovery of a temporary name without weakening identity checks.
 Without that checkpoint, the replacement must match the saved name or hostname; a suffix alone is not enough.
+Trusted checkpoint evidence also permits recovery of the archived old record when its hostname is absent;
+an archived name or matching IP alone does not authorize recovery.
 Legacy snapshots with no saved enabled-state baseline produce a manual-verification warning; compare
 those states with the operator's before-state because current data cannot establish the original values.
 An explicit source-interface binding on the old agent also refuses automatic recovery when readable.
 If an old snapshot omitted that binding and the old record is gone, inspect the operator's before-state;
 the tool cannot reconstruct the omitted setting from agent-level test membership.
 
-If automatic recovery refuses or lacks the snapshot, use the printed state and a manual procedure:
-prove replacement identity and ownership; restore/verify every share, test, enabled state, and target
-dependency; then delete only the confirmed offline old record and finish name/tags. Do not reset the
-appliance again to clear a partial state. Interrupted cluster moves require a manual procedure.
+If automatic recovery refuses or lacks trusted saved evidence, stop and retain the printed state.
+Do not guess identities or bypass the refusal. With a trusted snapshot/checkpoint and an approved manual
+procedure, prove replacement identity and ownership; restore/verify every share, test, enabled state, and target
+dependency; then disable the confirmed old registration, verify `enabled=false`, ensure
+`migration-status=MIGRATED-TO-BE-DELETED`, rename old to `MIGRATED-TO-BE-DELETED-<old-id>` and verify it,
+then finish the replacement's original full name/tags.
+Preserve other tags and shares; never delete or force-delete the old record. Do not reset the
+appliance again to clear a partial state. Interrupted legacy cluster moves require a manual procedure;
+production cluster migration is refused and is not qualified.
 
-For a failure after deletion, the old record cannot be restored by rerunning. Recovery must finish the
-replacement's metadata. Never delete snapshots or completion state merely to bypass a refusal.
+For a failure after disablement, marking or old-name archiving, recovery uses the trusted snapshot/replacement checkpoint to
+finish retirement and metadata without another reset. If a legacy run already deleted the old record,
+rerunning cannot restore it. Never delete snapshots or completion state merely to bypass a refusal.
 
 The JSON execution report is saved after each step start/result and retry message, including recovery.
 It is redacted and atomically replaced. An interrupted incremental report is not a completion record.
@@ -183,6 +217,7 @@ saved state before resuming. Keep the console transcript if local storage is una
 | Latest preview | `work/dry-run/` |
 | Apply reports and pre-reset snapshots | `work/apply/<date-time>/`, including `snapshots/*.json` |
 | Older snapshots inspected for recovery | `work/runs/**/snapshots/` |
+| Custom apply snapshots | Supply the same `--output DIR` again; recovery also reads `DIR/snapshots/` |
 | Completed replacements | `work/state/migrated.json`; prevents a new reset of a completed replacement |
 | Audit output | Incremental JSON steps/retries/recovery; final CSV tables and per-device summary |
 | `--inventory FILE` | Select another inventory |

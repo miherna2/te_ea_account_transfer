@@ -36,7 +36,7 @@ from te_agent_migrate.flow.preflight import (
 from te_agent_migrate.ui_client import TevaUiClient
 
 
-DRY_RUN_SCHEMA = 6
+DRY_RUN_SCHEMA = 8
 UI_USERNAME_ENV = "TE_AGENT_UI_USERNAME"
 UI_PASSWORD_ENV = "TE_AGENT_UI_PASSWORD"
 DRY_RUN_OK_FILENAME = "dry-run-ok.json"
@@ -166,7 +166,8 @@ def _finish_interrupted(console, prompter, report, api, source, agents, kwargs, 
     """
     known_completed = set(migrated_ids)
     try:
-        interrupted = find_interrupted(api, source.aid, agents, load_snapshots(WORK_DIR), console,
+        interrupted = find_interrupted(api, source.aid, agents,
+                                       load_snapshots(WORK_DIR, snapshot_dir=snapshot_dir), console,
                                        target_aid=kwargs.get('target_aid'), completed_ids=migrated_ids)
     except Exception as exc:
         # Uncertain recovery must not fall through to another destructive reset.
@@ -899,6 +900,9 @@ def _run_migration(
     repoint_a2a = True
     kwargs["repoint_a2a"] = True
     report.record_decision("Repoint agent-to-agent tests", "automatic")
+    report.record_decision("Old registration cleanup",
+                           "disable, tag migration-status=MIGRATED-TO-BE-DELETED and rename "
+                           "MIGRATED-TO-BE-DELETED-<old-id>; never delete")
     report.record_decision(
         "Auto re-enable tests", "enabled" if auto_reenable else "disabled (manual list)"
     )
@@ -980,23 +984,27 @@ def _run_migration(
         tokens = TargetTokens(report, prompter, console, labels=target_labels).collect(needed)
         target_token = tokens.get(target.aid, "")
         kwargs["target_account_token"] = target_token
-        if not _confirm_owner(console, prompter, report, source, pre_items):
-            console.info("run", "owner not confirmed; nothing was changed")
-            report.write_final()
-            return EXIT_FAILED
-        if not _precheck_devices(console, prompter, report, pre_items, get_ui_credentials):
-            report.write_final()
-            return EXIT_FAILED
-        if not prompter.confirm_destructive():
-            report.record_decision("Apply", "operator declined")
-            console.info("run", "operator declined; nothing was changed")
-            report.write_final()
-            return EXIT_FAILED
-        report.record_decision("Apply", "operator confirmed")
-        # Single use: the preview file that matched is marked as used before the first device is changed.
-        if dry_run_data is not None and gate_path:
-            _consume_dry_run_file(gate_path)
-            console.info("gate", "preview marked as used (%s.used)" % gate_path)
+        if needed:
+            if not _confirm_owner(console, prompter, report, source, pre_items):
+                console.info("run", "owner not confirmed; nothing was changed")
+                report.write_final()
+                return EXIT_FAILED
+            if not _precheck_devices(console, prompter, report, pre_items, get_ui_credentials):
+                report.write_final()
+                return EXIT_FAILED
+            if not prompter.confirm_destructive():
+                report.record_decision("Apply", "operator declined")
+                console.info("run", "operator declined; nothing was changed")
+                report.write_final()
+                return EXIT_FAILED
+            report.record_decision("Apply", "operator confirmed")
+            # Single use: consume the matching preview only before a new device migration.
+            if dry_run_data is not None and gate_path:
+                _consume_dry_run_file(gate_path)
+                console.info("gate", "preview marked as used (%s.used)" % gate_path)
+        else:
+            report.record_decision("Apply", "no new migrations")
+            console.info("run", "No new migrations are ready; nothing will be reset.")
     ctx = _build_flow_context(kwargs, str(snapshot_dir))
     if apply_mode:
         approved = _dry_run_binding(pre_items, owner_is_source, default_target_aid, repoint_a2a)

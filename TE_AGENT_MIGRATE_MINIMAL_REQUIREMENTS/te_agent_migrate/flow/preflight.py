@@ -775,11 +775,34 @@ def _auto_kind(inv, source_records):
         inv.kind = 'cluster'
 
 
-def _lookup(inv, groups, source, target, source_records, run_warnings):
+def _lookup(inv, groups, source, target, source_records, run_warnings, migrated_ids=()):
     """Find the device in the source group. Return (record, problem, warnings, done_item).
 
     ``done_item`` is a finished PreflightItem (skipped or blocked) or None.
     """
+    if not inv.is_cluster:
+        matching = [r for r in source_records if not r.is_cluster
+                    and _ip_matches(inv.ip_address, r) and _name_matches(inv.hostname, r)]
+        completed_ids = set(str(value) for value in (migrated_ids or ()))
+        completed = [r for r in matching if str(r.agent_id) in completed_ids
+                     and r.online and r.raw.get('enabled') is True]
+        retained_ids = set(str(r.agent_id) for r in source_records
+                           if not r.is_cluster and _ip_matches(inv.ip_address, r)
+                           and r.raw.get('enabled') is False)
+        if (len(completed) == 1 and (len(matching) > 1 or str(inv.agent_id) in retained_ids)
+                and (not inv.agent_id or str(inv.agent_id) in
+                     (set(str(r.agent_id) for r in matching) | retained_ids))
+                and all(r.raw.get('enabled') is False for r in matching if r is not completed[0])):
+            new = completed[0]
+            try:
+                visible = any(str(r.agent_id) == str(new.agent_id) and r.online
+                              and r.raw.get('enabled') is True for r in groups.agents(target))
+            except ApiError:
+                visible = False
+            if visible:
+                reason = 'already migrated: replacement %s is active; old registration is retained disabled' % new.agent_id
+                return None, None, [], _item(inv, STATUS_SKIPPED, reasons=[reason], record=new,
+                                             warnings=run_warnings)
     live = _live_by_name_ip(inv, source_records)
     unknown_id = _id_unknown(inv, source_records)
     if not inv.is_cluster and not live and (unknown_id or not inv.agent_id):
@@ -819,7 +842,8 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
     _auto_kind(inv, source_records)
     if inv.is_cluster and getattr(ctx, 'standalone_only', False):
         return _blocked(inv, ['cluster migration is not qualified for production; use standalone agents only'])
-    record, problem, warnings, done = _lookup(inv, groups, source, target, source_records, run_warnings)
+    record, problem, warnings, done = _lookup(inv, groups, source, target, source_records, run_warnings,
+                                            getattr(ctx, 'migrated_ids', None))
     if done is not None:
         return done
     warnings = list(warnings) + list(run_warnings)

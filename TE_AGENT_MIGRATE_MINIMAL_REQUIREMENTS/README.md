@@ -5,7 +5,9 @@ Only standalone agents are supported. The production CLI refuses clusters.
 
 - **Only the agent moves.** The tests stay in their account group and keep their IDs.
 - The new agent is shared with the same account groups that saw the old one, plus the source group.
-- The new agent gets the same tests as the old one. The old agent is deleted after verification.
+- The new agent gets the same tests as the old one. After verification, the old registration is disabled
+  and tagged `migration-status=MIGRATED-TO-BE-DELETED`, then renamed `MIGRATED-TO-BE-DELETED-<old-id>`.
+  It is never deleted by this workflow.
 - The default is a **preview**. Nothing changes until you run it with `--apply`.
 - No `.env` file or environment variables are required. The tool asks for what it needs. Existing exported
   `TE_*` settings are still accepted; `.env` files are not loaded automatically.
@@ -55,6 +57,9 @@ BEFORE                                        AFTER
 
 The agent keeps its name and its IP address. It gets a **new agent ID**, because a reset agent that
 registers in another group is a new agent for ThousandEyes.
+The old registration stays in the source group, disabled, marked and renamed `MIGRATED-TO-BE-DELETED-<old-id>`.
+This frees the original full name for the active replacement. The intended result is one active
+replacement plus one disabled old record, not one total record.
 
 ### The steps, one device at a time
 
@@ -66,20 +71,26 @@ flowchart LR
     D --> E["5. Share B with the same groups<br/>(100, 300 ...)"]
     E --> F["6. Give B the tests that A had"]
     F --> G["7. Point agent-to-agent tests<br/>at B"]
-    G --> H["8. Verify, then delete<br/>the old agent A"]
+    G --> H["8. Verify, then disable,<br/>mark and rename old agent A"]
     H --> I["9. Name and tags<br/>restored"]
 ```
 
-The tool stops at the first failure and prints the device state. Before deleting A it verifies that B is
-online, shared with every required group, has all expected tests, and has the required agent-to-agent
+The tool stops at the first failure and prints the device state. Before disabling A it verifies B's identity,
+online status and explicit API `enabled=true`, every saved/current share and assignment, and the required agent-to-agent
 targets. Assignment uses batches of at most 10 and retries missing tests for up to three rounds.
 Saved enabled/disabled states must be preserved; a regression stops completion for manual correction.
-Before deletion, the tool reads live sharing, assignments and target dependencies again. Missing data or
-a dependency still using the old agent stops cleanup. Keep these settings unchanged during a migration:
-the API cannot make the final check and deletion one atomic operation.
-Name and tag restoration follows deletion. A rename failure stops the run even though A has already been
-deleted. Tag-restoration failures remain warnings and can accompany a successful exit: inspect them and
-finish the listed tags manually.
+Before retirement, the tool reads live sharing, assignments and target dependencies again. Missing data or
+a target dependency still using the old agent stops retirement. An old registration still reporting online
+is not itself a blocker. The tool disables it through the API, verifies `enabled=false`, and ensures
+`migration-status=MIGRATED-TO-BE-DELETED` is assigned without removing other tags or shares.
+There is no delete or force-delete step. Keep configuration unchanged: the final reads and writes are not atomic.
+The tool then renames the disabled, marked old record to `MIGRATED-TO-BE-DELETED-<old-id>` and verifies it
+before restoring the replacement's original full name and tags. A rename failure stops the run; replacement
+tag-restoration warnings require manual follow-up. Neither a warning nor a successful replacement
+substitutes for verified old-record disablement and its migration-status tag.
+The API token needs source-group agent and tag-management permissions. If disablement or tag verification
+or old-name verification fails, the run stops with its checkpoint intact; resume after resolving the failure,
+without another reset.
 
 ### The run, from your side
 
@@ -128,7 +139,8 @@ The tool can discover only what the token and returned API metadata expose. Comp
 known sharing groups; a group invisible to the token cannot be assumed to have no dependencies.
 
 An agent that you see in the source group is either **owned** by that group or only **shared** with it.
-The ThousandEyes API does not tell which. This matters because the move deletes the old agent:
+The ThousandEyes API does not tell which. This matters because the move resets the appliance and disables
+the old registration:
 
 ```
  CASE 1: the source group OWNS the agent        CASE 2: the source group only SEES it
@@ -334,7 +346,7 @@ flowchart TD
     S -- no --> N["Normal run"]
     S -- yes --> O{"Snapshot matches the selected device<br/>and source/destination;<br/>one matching new agent online?"}
     O -- no --> BLOCK["Stop: inspect the identity or snapshot conflict"]
-    O -- yes --> L["List what is left:<br/>share, tests, delete old agent, rename, tags"]
+    O -- yes --> L["List what is left:<br/>share, tests, disable/mark/rename old,<br/>replacement name and tags"]
     L --> P{"--apply?"}
     P -- no --> I["Preview only tells you"]
     P -- yes --> Q{"Finish N migration(s)<br/>now? (y/n)"}
@@ -343,20 +355,29 @@ flowchart TD
 ```
 
 Recovery uses the current inventory and source/destination selection. It requires a matching snapshot,
-device identity, and one online replacement; an IP address alone is insufficient. It preserves existing
-live shares and adds missing shares and tests. The old standalone agent must be verified offline before
-deletion. A mismatch, ambiguous candidate, invalid test state, or failed check requires manual handling.
+device identity, and one online replacement with explicit API `enabled=true`; an IP address alone is
+insufficient. It preserves existing
+live shares and adds missing shares and tests. After all checks pass, it finishes old-record disablement
+and marking, verifies its archived name `MIGRATED-TO-BE-DELETED-<old-id>`, then restores the replacement's
+name and tags without another appliance reset. The old registration
+may still report online; this alone does not block retirement. A mismatch, ambiguous candidate, unreadable
+identity/dependencies, invalid test state, or failed check requires manual handling.
 The snapshot records the replacement ID after registration is verified and before test restoration.
 This checkpoint can identify a temporary name without a matching hostname. Older snapshots still require
 the stricter saved name/hostname match; a name suffix alone does not authorize recovery.
+Recovery can also recognize the archived old record from trusted checkpoint evidence when its hostname
+is absent; the archived name alone is not identity proof.
 Keep the snapshots in `work/apply` (or older `work/runs`) until recovery and post-migration checks are done.
+If the interrupted apply used `--output DIR`, rerun with the same `--output DIR`: recovery also reads
+`DIR/snapshots`. Use ordinary `--apply` recovery without the old `--confirmed-dry-run-file` or `.used` proof.
 Older snapshots without saved enabled states produce a manual-verification warning: compare those tests
 with the operator's before-state, because the tool cannot prove their original enabled state.
 If an older snapshot omitted per-agent source-interface settings and the old record is gone, compare the
 test configuration with the operator's before-state; automatic recovery cannot reconstruct that binding.
 
-An offline old entry plus a new entry with a temporary name can indicate an interrupted migration.
-Check every group's sharing and test membership before any manual deletion.
+An old entry plus a replacement with a temporary name can indicate an interrupted migration.
+Use the trusted snapshot/checkpoint to finish retirement and metadata; do not delete the old record or
+reset the appliance again. Two records are intentional once the old one is disabled and marked.
 
 ### A device is blocked in the preview
 

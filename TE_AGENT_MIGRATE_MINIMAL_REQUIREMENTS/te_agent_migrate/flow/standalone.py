@@ -2,8 +2,8 @@
 
 Tests stay in the source account group and keep their IDs. The agent is reset,
 registered in the target group, shared back to every group that saw it, and
-the original tests are assigned to the new agent. The old agent is deleted
-only after the new agent is online, shared, and the tests are verified.
+the original tests are assigned to the new agent. The old registration is disabled
+and marked for later manual deletion only after the replacement is verified.
 
 Dry run (``ctx.apply`` False) sends no write call and opens no agent UI. It does
 run the GET-only checks of apply (clean target group), so both modes give the
@@ -14,9 +14,9 @@ Agent-to-agent tests (``--repoint-agent-to-agent``)
 The new agent has a NEW id. An agent-to-agent test names its target agent by id, so a test that targets the
 device must be pointed at the new id. Preflight records such tests in ``item.a2a_targets`` (only when the flag
 is on). When the list is not empty, the step ``repoint a2a targets`` runs after the tests are assigned and
-verified and BEFORE the old agent is deleted. For each recorded test it calls
+verified and BEFORE the old agent is disabled. For each recorded test it calls
 ``ctx.api.set_agent_to_agent_target(test_id, new_id, aid, old_target_agent_id)``. If one call fails, the flow
-raises ``FlowAborted``: the new agent stays online, the old agent is NOT deleted, and the message lists the
+raises ``FlowAborted``: the new agent stays online, retirement stops, and the message lists the
 test ids that were repointed and the ones that were not. The snapshot file holds ``a2a_targets`` with the old
 target ids, so an operator can undo the change by hand. A dry run prints the step with the test count and sends
 no write.
@@ -24,7 +24,7 @@ no write.
 from contextlib import contextmanager
 
 from te_agent_migrate.api_client import AmbiguousAgentMatch, ThousandEyesApiClient
-from te_agent_migrate.errors import AuthenticationError, UiError, VisibilityTimeout
+from te_agent_migrate.errors import ApiError, AuthenticationError, UiError, VisibilityTimeout
 from te_agent_migrate.models import StepStatus
 from te_agent_migrate.output import mask_secrets
 from te_agent_migrate.flow.context import FlowAborted, FlowResult, a2a_targets_of, attach_stop_info
@@ -43,7 +43,7 @@ STEP_ASSIGN_TESTS = 'api_assign_tests'
 ASSIGN_CHUNK_SIZE = 10  # tests per assign call; 81 in one call timed out (30 s)
 ASSIGN_ROUNDS = 3       # send, check, resend only what is missing
 STEP_REPOINT_A2A = 'repoint a2a targets'
-STEP_DELETE_OLD = 'api_delete_old'
+STEP_RETIRE_OLD = 'api_retire_old'
 STEP_RENAME = 'api_rename'
 STEP_RESTORE_TAGS = 'api_restore_tags'
 STEP_MANUAL_RULES = 'manual_notification_rules'
@@ -59,9 +59,11 @@ STATE_SHARED = 'new agent is online and shared; old agent is still present; test
 STATE_VERIFIED = 'new agent is online, shared, tests verified; old agent is still present'
 STATE_A2A_DONE = ('new agent is online, shared, tests verified, agent-to-agent tests repointed; '
                   'old agent is still present')
-STATE_DELETE_SENT = ('delete sent, not confirmed; the old agent may or may not be deleted; '
+STATE_RETIRE_SENT = ('disable sent, not confirmed; old registration is retained; '
                      'new agent is online, shared, tests verified')
-STATE_DELETED = 'old agent deleted; new agent is online and serves the tests; name or tags may be incomplete'
+STATE_RETIRED = 'old agent disabled, marked and renamed for manual deletion; new agent name or tags may be incomplete'
+RETIREMENT_TAG_KEY = 'migration-status'
+RETIREMENT_TAG_VALUE = 'MIGRATED-TO-BE-DELETED'
 
 
 # --------------------------------------------------------------------------- helpers
@@ -198,9 +200,10 @@ def plan_standalone(item, target_aid=None):
         plan.append((STEP_REPOINT_A2A,
                      'repoint %d agent-to-agent test(s) from old agent id %s to the new agent id (tests %s); '
                      'stop and keep the old agent if one fails' % (len(a2a), old_id, _a2a_text(a2a))))
-    plan.append((STEP_DELETE_OLD,
-                 'delete old agent %s in aid %s after share and tests are verified; wait until absent'
-                 % (old_id, owner)))
+    plan.append((STEP_RETIRE_OLD,
+                 'disable old agent %s in aid %s, tag %s=%s and rename it to %s after sharing and tests are verified; '
+                 'do not delete'
+                 % (old_id, owner, RETIREMENT_TAG_KEY, RETIREMENT_TAG_VALUE, retired_agent_name(old_id))))
     plan.append((STEP_RENAME, 'set the new agent name to %r in aid %s and wait for it' % (item.name, target_text)))
     if item.tags:
         plan.append((STEP_RESTORE_TAGS, 'restore %d tags: %s' % (len(item.tags), _tags_text(item.tags))))
@@ -566,7 +569,7 @@ def _live_groups(record, owner):
 
 
 def _verify_live_dependencies(ctx, item, old, current):
-    """Reconcile live dependencies, not only the pre-reset snapshot, before DELETE."""
+    """Reconcile live dependencies, not only the pre-reset snapshot, before retirement."""
     old_id, new_id = str(old.agent_id), str(current.agent_id)
     old_groups = _live_groups(old, item.owner_aid or ctx.source_aid)
     required_groups = old_groups | set(_desired_groups(item, ctx.target_aid))
@@ -603,42 +606,139 @@ def _verify_live_dependencies(ctx, item, old, current):
     _verify_enabled(ctx, item, new_id)
 
 
-def _delete_old(ctx, item, old_id, new_id, state=None):
+def _retirement_tag(api, owner):
+    matches = [tag for tag in api.list_tags(owner, expand_assignments=True)
+               if tag.get('key') == RETIREMENT_TAG_KEY and tag.get('value') == RETIREMENT_TAG_VALUE
+               and tag.get('objectType') == 'v-agent' and tag.get('type') == 'static']
+    if len(matches) > 1:
+        raise FlowAborted('multiple retirement tags match; select the correct tag manually')
+    return matches[0] if matches else None
+
+
+def _retirement_tag_on(tag, old_id):
+    assignments = tag.get('assignments') if tag else None
+    return isinstance(assignments, list) and any(
+        isinstance(entry, dict) and str(entry.get('id')) == str(old_id) and entry.get('type') == 'v-agent'
+        for entry in assignments)
+
+
+def retired_agent_name(agent_id):
+    return '%s-%s' % (RETIREMENT_TAG_VALUE, agent_id)
+
+
+def _retirement_complete(api, owner, old):
+    return (old.raw.get('enabled') is False and old.name == retired_agent_name(old.agent_id)
+            and _retirement_tag_on(_retirement_tag(api, owner), old.agent_id))
+
+
+def _uncertain_agent_write(error, agent_id):
+    prefix = 'API PUT agents/%s ' % agent_id
+    return str(error).startswith((prefix + 'failed:', prefix + 'returned HTTP 5'))
+
+
+def _retire_old(ctx, item, old_id, new_id, state=None):
     owner = item.owner_aid or ctx.source_aid
     if old_id == new_id:
-        ctx.skipped(item.name, STEP_DELETE_OLD, 'old and new agent id are the same (%s); nothing deleted' % old_id)
-        return
-    with ctx.step(item.name, STEP_DELETE_OLD, 'deleted old agent %s in aid %s' % (old_id, owner), changed=True):
+        raise FlowAborted('old and replacement IDs are equal; refusing to disable the active agent')
+    archive_name = retired_agent_name(old_id)
+    with ctx.step(item.name, STEP_RETIRE_OLD,
+                  'old agent %s disabled, tagged %s=%s and renamed %s; registration retained'
+                  % (old_id, RETIREMENT_TAG_KEY, RETIREMENT_TAG_VALUE, archive_name)) as outcome:
         current = ctx.api.get_agent(ctx.target_aid, new_id)
-        if not current.online:
-            raise FlowAborted('new agent %s is not online (state %s); old agent was NOT deleted' % (new_id, current.state))
+        if not current.online or current.raw.get('enabled') is not True:
+            raise FlowAborted('new agent %s is not online and enabled; retirement stopped' % new_id)
         names, ips = _name_candidates(item), _device_ips(item)
+        old_names = _unique(names + [archive_name])
         if (str(current.agent_id) != str(new_id) or current.is_cluster
                 or str(current.agent_type or '').casefold() != 'enterprise'
                 or not ThousandEyesApiClient.match_new_agents([current], names, ips, [])):
-            raise FlowAborted('new agent identity changed before cleanup; old agent was NOT deleted')
+            raise FlowAborted('new agent identity changed before cleanup; retirement stopped')
         old = ctx.api.get_agent(owner, old_id)
         if str(old.agent_id) != str(old_id):
-            raise FlowAborted('old agent identity changed; old agent was NOT deleted')
+            raise FlowAborted('old agent identity changed; retirement stopped')
         _verify_live_dependencies(ctx, item, old, current)
-        # Dependency reads can take time. Recheck both identities immediately before DELETE.
+        # Dependency reads can take time. Recheck both identities immediately before disabling.
         current = ctx.api.get_agent(ctx.target_aid, new_id)
         if (str(current.agent_id) != str(new_id) or current.is_cluster
                 or str(current.agent_type or '').casefold() != 'enterprise'
+                or current.raw.get('enabled') is not True
                 or not ThousandEyesApiClient.match_new_agents([current], names, ips, [])):
-            raise FlowAborted('new agent identity or online state changed; old agent was NOT deleted')
+            raise FlowAborted('new agent identity or online state changed; retirement stopped')
         old = ctx.api.get_agent(owner, old_id)
-        agent_type = _delete_type(ctx, owner, old, old_id)
-        if (str(old.agent_id) != str(old_id) or old.is_cluster or agent_type.casefold() != 'enterprise'
-                or str(old.state or '').strip().casefold() != 'offline'
-                or not ThousandEyesApiClient.match_new_agents([old], names, ips, [], online_only=False)):
-            raise FlowAborted('old agent identity or offline state changed before cleanup; '
-                              'old agent was NOT deleted')
+        if (str(old.agent_id) != str(old_id) or old.is_cluster
+                or str(old.agent_type or '').casefold() != 'enterprise'
+                or not ThousandEyesApiClient.match_new_agents([old], old_names, ips, [], online_only=False)):
+            raise FlowAborted('old agent identity changed before cleanup; retirement stopped')
+        if not isinstance(old.raw.get('enabled'), bool):
+            raise FlowAborted('old agent enabled state is unreadable; retirement stopped')
+        if old.raw['enabled']:
+            if state is not None:
+                state[0] = STATE_RETIRE_SENT
+            outcome.status = StepStatus.CHANGED
+            try:
+                ctx.api.set_agent_enabled(owner, old_id, False)
+            except ApiError as exc:
+                if not _uncertain_agent_write(exc, old_id):
+                    raise
+                ctx.console.info(item.name, 'disable request outcome is uncertain; checking the old registration '
+                                 'without repeating the write')
+
+        def disabled():
+            record = ctx.api.get_agent(owner, old_id)
+            if (str(record.agent_id) != str(old_id) or record.is_cluster
+                    or str(record.agent_type or '').casefold() != 'enterprise'
+                    or not ThousandEyesApiClient.match_new_agents([record], old_names, ips, [], online_only=False)):
+                raise FlowAborted('old agent identity changed while verifying retirement')
+            return record.raw.get('enabled') is False, record
+
+        confirmed, _ = _poll_until(ctx, disabled)
+        if not confirmed:
+            raise FlowAborted('old agent disable was not verified; registration retained, stop and inspect')
         if state is not None:
-            state[0] = STATE_DELETE_SENT
-        ctx.api.delete_agent(owner, old_id, agent_type=agent_type)
-        ctx.api.wait_for_agent_absent(owner, agent_id=old_id, timeout_seconds=ctx.timeout_seconds,
-                                      poll_interval_seconds=ctx.poll_seconds)
+            state[0] = 'old agent disabled and retained; retirement tag or final name may be incomplete'
+        _verify_enabled(ctx, item, new_id)
+        tag = _retirement_tag(ctx.api, owner)
+        if tag is None:
+            outcome.status = StepStatus.CHANGED
+            tag = ctx.api.create_tag(owner, {'key': RETIREMENT_TAG_KEY, 'value': RETIREMENT_TAG_VALUE,
+                                            'objectType': 'v-agent', 'type': 'static', 'color': '#00bceb'})
+        tag_id = ThousandEyesApiClient._scalar_id(tag.get('tagId', tag.get('id')))
+        if not tag_id:
+            raise FlowAborted('retirement tag ID is unreadable; old agent remains disabled')
+        if not _retirement_tag_on(tag, old_id):
+            outcome.status = StepStatus.CHANGED
+            ctx.api.assign_tag(owner, tag_id, [{'id': old_id, 'type': 'v-agent'}])
+        tagged, _ = _poll_until(ctx, lambda: (
+            _retirement_tag_on(_retirement_tag(ctx.api, owner), old_id), None))
+        if not tagged:
+            raise FlowAborted('retirement tag assignment was not verified; old agent remains disabled')
+        confirmed, old = disabled()
+        if not confirmed:
+            raise FlowAborted('old agent is no longer disabled; retirement stopped')
+        # Agent names are organization-wide unique. Free the original name without deleting the old record.
+        if old.name != archive_name:
+            outcome.status = StepStatus.CHANGED
+            try:
+                ctx.api.update_agent_name(owner, old_id, archive_name)
+            except ApiError as exc:
+                if not _uncertain_agent_write(exc, old_id):
+                    raise
+                ctx.console.info(item.name, 'old-name update outcome is uncertain; checking its archive name '
+                                 'without repeating the write')
+
+        def archived():
+            is_disabled, record = disabled()
+            return is_disabled and record.name == archive_name, record
+
+        confirmed, _ = _poll_until(ctx, archived)
+        if not confirmed:
+            raise FlowAborted('old agent archive name was not verified; replacement name was not changed')
+        current = ctx.api.get_agent(ctx.target_aid, new_id)
+        if (str(current.agent_id) != str(new_id) or current.is_cluster
+                or str(current.agent_type or '').casefold() != 'enterprise'
+                or current.raw.get('enabled') is not True
+                or not ThousandEyesApiClient.match_new_agents([current], names, ips, [])):
+            raise FlowAborted('replacement is not confirmed active after retirement; stop and inspect')
 
 
 def _rename(ctx, item, new_id):
@@ -646,7 +746,13 @@ def _rename(ctx, item, new_id):
         current = ctx.api.get_agent(ctx.target_aid, new_id)
         if current.name != item.name:
             outcome.status = StepStatus.CHANGED  # a write is sent; an equal name is a read-only check (ok)
-            ctx.api.update_agent_name(ctx.target_aid, new_id, item.name)
+            try:
+                ctx.api.update_agent_name(ctx.target_aid, new_id, item.name)
+            except ApiError as exc:
+                if not _uncertain_agent_write(exc, new_id):
+                    raise
+                ctx.console.info(item.name, 'rename request outcome is uncertain; checking the replacement name '
+                                 'without repeating the write')
         ctx.api.wait_for_agent_name(ctx.target_aid, agent_id=new_id, expected_name=item.name,
                                     timeout_seconds=ctx.timeout_seconds, poll_interval_seconds=ctx.poll_seconds)
 
@@ -819,8 +925,8 @@ def _run(ctx, item, host, state):
     state[0] = STATE_VERIFIED
     repointed = _repoint_a2a(ctx, item, old_id, new_id, state)
 
-    _delete_old(ctx, item, old_id, new_id, state)
-    state[0] = STATE_DELETED
+    _retire_old(ctx, item, old_id, new_id, state)
+    state[0] = STATE_RETIRED
     _verify_enabled(ctx, item, new_id)
 
     _rename(ctx, item, new_id)
@@ -828,6 +934,7 @@ def _run(ctx, item, host, state):
     ctx.skipped(host, STEP_MANUAL_RULES, MANUAL_RULES_TEXT)
     state[0] = 'done'
     detail = 'migrated: old agent %s -> new agent %s' % (old_id, new_id)
+    detail += '; old registration retained disabled and marked for manual deletion'
     if repointed:
         detail += '; %d a2a test(s) repointed' % repointed
     return FlowResult(host, True, detail,

@@ -279,7 +279,7 @@ class ThousandEyesApiClient(object):
     def list_agents(self, aid, agent_types="enterprise"):
         params = {"agentTypes": agent_types, "expand": "test-ids"}
         return [
-            AgentRecord.from_api(item, aid)
+            self._listed_agent(item, aid)
             for item in self._paginate("agents", "agents", aid=aid, params=params)
         ]
 
@@ -289,16 +289,31 @@ class ThousandEyesApiClient(object):
             "expand": "cluster-member,test-ids",
         }
         return [
-            AgentRecord.from_api(item, aid)
+            self._listed_agent(item, aid)
             for item in self._paginate("agents", "agents", aid=aid, params=params)
         ]
 
-    def get_agent(self, aid, agent_id):
+    def _listed_agent(self, raw, aid):
+        record = AgentRecord.from_api(raw, aid)
+        # List responses can omit empty expansions. Only an explicit detail list proves zero tests.
+        if "testIds" not in raw and "tests" not in raw:
+            if not record.agent_id.isdigit():
+                raise ApiError("Agent listing has no valid ID for assignment verification")
+            detail = self.get_agent(aid, record.agent_id, expand="test-ids")
+            if detail.agent_id != record.agent_id or not detail.test_ids_known:
+                raise ApiError("Cannot verify test assignments for agent %s in group %s"
+                               % (record.agent_id, aid))
+            record.test_ids = list(detail.test_ids)
+            record.test_ids_known = True
+            record.raw["testIds"] = list(detail.test_ids)
+        return record
+
+    def get_agent(self, aid, agent_id, expand="cluster-member"):
         payload = self.request(
             "GET",
             "agents/%s" % agent_id,
             aid=aid,
-            params={"expand": "cluster-member"},
+            params={"expand": expand},
         )
         raw = payload
         if "agentId" not in payload and "id" not in payload:
@@ -310,6 +325,15 @@ class ThousandEyesApiClient(object):
         if not isinstance(raw, dict):
             raise ApiError("Agent %s returned an unexpected JSON shape" % agent_id)
         return AgentRecord.from_api(raw, aid)
+
+    def set_agent_enabled(self, aid, agent_id, enabled):
+        """Change only the enabled state of the selected registration."""
+        if not isinstance(enabled, bool):
+            raise ApiError("Agent enabled state must be a boolean")
+        return self.request(
+            "PUT", "agents/%s" % agent_id, aid=aid,
+            json_body={"enabled": enabled}, expected=set((200, 204)), safe_to_retry=False,
+        )
 
     def set_agent_account_groups(self, aid, agent_id, account_group_ids):
         cleaned = []
@@ -570,11 +594,13 @@ class ThousandEyesApiClient(object):
             "tags/%s/assign" % tag_id,
             aid=aid,
             json_body={"assignments": normalized},
-            expected=set((200, 201, 204)),
+            expected=set((200, 201, 204, 207)),
             safe_to_retry=False,
         )
 
     def create_tag(self, aid, payload):
+        payload = dict(payload)
+        payload.setdefault("accessType", "all")
         response = self.request(
             "POST", "tags", aid=aid, json_body=payload, expected=set((200, 201)), safe_to_retry=False
         )
