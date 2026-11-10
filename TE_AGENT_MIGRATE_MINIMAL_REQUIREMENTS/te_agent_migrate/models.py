@@ -148,6 +148,7 @@ class AgentRecord(_Record):
         self.account_group_name = account_group_name
         self.labels = list(labels or [])
         self.test_ids = list(test_ids or [])
+        self.test_ids_known = True
         self.raw = dict(raw or {})
         self.agent_type = agent_type
 
@@ -197,10 +198,14 @@ class AgentRecord(_Record):
                 if ip not in ips:
                     ips.append(ip)
         tests = []
-        for item in value.get("testIds", value.get("tests", [])) or []:
+        raw_tests = value.get("testIds", value.get("tests"))
+        tests_known = isinstance(raw_tests, list)
+        for item in raw_tests if isinstance(raw_tests, list) else []:
             test_id = item.get("testId", item.get("id")) if isinstance(item, dict) else item
-            if test_id is not None:
+            if isinstance(test_id, (str, int)) and not isinstance(test_id, bool) and str(test_id).strip():
                 tests.append(str(test_id))
+            else:
+                tests_known = False
         agent_type = value.get("agentType")
         agent_type = str(agent_type).casefold() if agent_type is not None else None
         state_value = value.get("agentState", value.get("state"))
@@ -213,7 +218,7 @@ class AgentRecord(_Record):
                 state_value = "online"
             else:
                 state_value = "unknown"
-        return cls(
+        record = cls(
             agent_id=str(value.get("agentId", value.get("id", ""))),
             name=str(value.get("agentName", value.get("name", ""))),
             hostname=value.get("hostname"),
@@ -228,6 +233,8 @@ class AgentRecord(_Record):
             cluster_members=members,
             shared_aids=cls._account_group_ids(value.get("accountGroups")),
         )
+        record.test_ids_known = tests_known
+        return record
 
 
 class TestRecord(_Record):

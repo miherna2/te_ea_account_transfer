@@ -16,7 +16,7 @@ AAAA - HOST01,192.0.2.11,22
 `target` is optional and accepts a group ID or exact group name. If omitted, an approved `OK` entry in
 `work/input/prefix_map.csv` supplies the destination; otherwise the tool asks once for the run destination.
 A standalone needs both name and IP. Explicit `agent_id` and `type` columns remain supported. A row without
-an IP is treated as a cluster lookup; clusters are outside the current production scope.
+an IP is treated as a cluster lookup. Explicit and automatically detected clusters are refused.
 
 If the inventory does not exist, an interactive run asks for `name ip` lines and saves them. Do not put
 passwords or tokens in an inventory: secret-looking columns are refused. Confirm source ownership and
@@ -77,6 +77,7 @@ migration: normal assignment does not preserve its per-agent `sourceIpAddress`. 
 qualified manual procedure. A source group's visibility alone does not establish ownership.
 Compare discovered groups with the known sharing list: groups hidden from both the token and returned API
 metadata cannot be proven dependency-free by an empty scan.
+Missing or malformed assignment data is a blocker, not proof of zero tests.
 
 ## 4. Apply
 
@@ -98,6 +99,13 @@ cannot prove that it belongs to the intended group; wrong-group registration det
 **Apply resets real appliances; a reset cannot be undone.** Allow for reset and registration downtime.
 Do not close the terminal or interrupt a device deliberately. Devices run one at a time; a failure stops
 the batch. Reports go to `work/apply/<date-time>`. Keep the reported old/new IDs and snapshot paths.
+The tool checks the approved plan again after confirmation and before each device starts.
+Changed assignments, enabled states, shares or target dependencies stop the affected migration.
+
+Keep sharing, tests and target settings unchanged for the full move. Immediately before deletion, the
+tool reads live dependencies again. It retains the old record if a required share or assignment is missing,
+a target still uses the old ID, or required data is unreadable. The API has no atomic check-and-delete
+operation; concurrent changes after the final read remain a risk.
 
 ### Strict preview compatibility
 
@@ -105,6 +113,8 @@ the batch. Reports go to `work/apply/<date-time>`. Keep the reported old/new IDs
 supplied `--confirmed-dry-run-file FILE` requires a usable clean preview for the same inventory, groups,
 and current plan before writes. A missing, invalid, used, or mismatched explicit proof refuses apply.
 A matching proof is single-use and is marked `.used` when apply starts.
+Create a new preview after an upgrade. Schema 6 also binds per-group test IDs and enabled states;
+older proofs cannot authorize the new checks.
 
 ```bash
 python3 -m te_agent_migrate --inventory work/input/inventory.csv --output work/preview-one
@@ -144,6 +154,9 @@ writes. Apply offers a separate confirmation to finish a safely identified inter
 It requires a matching snapshot, current selection, and one online replacement with sufficient device
 identity. An IP match alone, an online old agent, ambiguous replacements, conflicting ownership, or missing
 critical test state does not authorize deletion. Recovery preserves live shares and adds missing tests.
+After verified registration, the snapshot is updated atomically with the replacement ID, destination and
+observed identity. This checkpoint permits recovery of a temporary name without weakening identity checks.
+Without that checkpoint, the replacement must match the saved name or hostname; a suffix alone is not enough.
 Legacy snapshots with no saved enabled-state baseline produce a manual-verification warning; compare
 those states with the operator's before-state because current data cannot establish the original values.
 An explicit source-interface binding on the old agent also refuses automatic recovery when readable.
@@ -158,6 +171,11 @@ appliance again to clear a partial state. Interrupted cluster moves require a ma
 For a failure after deletion, the old record cannot be restored by rerunning. Recovery must finish the
 replacement's metadata. Never delete snapshots or completion state merely to bypass a refusal.
 
+The JSON execution report is saved after each step start/result and retry message, including recovery.
+It is redacted and atomically replaced. An interrupted incremental report is not a completion record.
+If the report or checkpoint cannot be saved, execution stops; restore local write access and inspect the
+saved state before resuming. Keep the console transcript if local storage is unavailable.
+
 ## 7. Files, options, and compatibility
 
 | Item | Location or behavior |
@@ -166,11 +184,11 @@ replacement's metadata. Never delete snapshots or completion state merely to byp
 | Apply reports and pre-reset snapshots | `work/apply/<date-time>/`, including `snapshots/*.json` |
 | Older snapshots inspected for recovery | `work/runs/**/snapshots/` |
 | Completed replacements | `work/state/migrated.json`; prevents a new reset of a completed replacement |
-| Audit output | JSON report, CSV tables, and per-device summary printed at the end |
+| Audit output | Incremental JSON steps/retries/recovery; final CSV tables and per-device summary |
 | `--inventory FILE` | Select another inventory |
 | `--timeout SECONDS` | Wait limit; not a guarantee a timed-out request did not apply |
 | `-v` | More output |
-| `--auto-reenable-tests` | Explicit cluster-only full test update; masked secrets may make it unsafe |
+| `--auto-reenable-tests` | Legacy option; no standalone state repair and no permission to migrate clusters |
 | Legacy flags | `--dry-run`, `--owner-is-source`, `--repoint-agent-to-agent` are accepted but unnecessary |
 
 Migration exit 0 can still include nonfatal tag-restoration warnings. Exit 1 means failure, blocker, or an

@@ -26,6 +26,10 @@ committing, pushing, or changing packaging and ignore rules.
 - `.gitignore` does not remove previously tracked files. If excluded material is
   already tracked, remove it from the index while preserving the local copy.
   Do not rewrite remote history without explicit authorization.
+- Before each publication, check `git diff --cached --name-only` and
+  `git diff --cached`. Confirm with `git check-ignore` that local tests, lab
+  configuration, architecture, credentials, and runtime evidence remain excluded.
+  Keep file-mode-only changes out of a content fix unless they are intentional.
 
 The shared `.gitignore` files and package allowlist enforce this boundary in new
 clones. Changes to them must preserve the rule above.

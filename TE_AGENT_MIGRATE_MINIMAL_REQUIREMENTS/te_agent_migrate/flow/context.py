@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -193,6 +194,8 @@ class FlowContext(object):
         ``StepStatus.SKIPPED``) before the result line is printed.
         """
         outcome = StepOutcome(detail, changed)
+        if getattr(self.console, 'event_sink', None) is not None:
+            self.console.progress(host, name, detail or 'in progress')
         try:
             yield outcome
         except GeneratorExit:
@@ -292,6 +295,29 @@ class FlowContext(object):
         self.snapshot_path = path
         self.console.info(host, 'snapshot file written: %s' % path)
         return path
+
+    def checkpoint_replacement(self, agent):
+        """Bind recovery to the identity verified after registration, before further writes."""
+        if not self.snapshot_path:
+            return
+        with open(self.snapshot_path, encoding='utf-8') as handle:
+            data = json.load(handle)
+        data['replacement'] = {
+            'agent_id': str(agent.agent_id), 'target_aid': self.target_aid,
+            'name': agent.name, 'hostname': agent.hostname,
+            'ip_addresses': list(agent.ip_addresses),
+        }
+        descriptor, temporary = tempfile.mkstemp(prefix='.replacement-', dir=os.path.dirname(self.snapshot_path))
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+                handle.write('\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.snapshot_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 class FlowResult(object):

@@ -2,6 +2,8 @@
 
 import csv
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -65,6 +67,7 @@ class RunReport(object):
         self.decisions = []
         self.errors = []
         self._lock = RLock()
+        self._final = False
 
     @property
     def json_path(self):
@@ -79,6 +82,14 @@ class RunReport(object):
             self.steps.append(_plain(event.to_dict() if isinstance(event, StepEvent) else event))
 
     record_event = record_step
+
+    def record_console(self, agent, step, status, detail):
+        with self._lock:
+            self.record_step({"timestamp": utc_now(), "agent": agent, "step": step,
+                              "status": status, "detail": detail})
+            self.write_incremental()
+            if self._final:
+                self.write_csv()
 
     def record_decision(self, prompt, response, agent=None):
         with self._lock:
@@ -170,10 +181,18 @@ class RunReport(object):
             return redact_value(_plain(payload))
 
     def write_json(self, final=False):
-        self.json_path.write_text(
-            json.dumps(self.to_dict(final), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        self._final = self._final or final
+        descriptor, temporary = tempfile.mkstemp(prefix=".report-", dir=str(self.output_dir))
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(self.to_dict(self._final), handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, str(self.json_path))
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         return self.json_path
 
     @staticmethod

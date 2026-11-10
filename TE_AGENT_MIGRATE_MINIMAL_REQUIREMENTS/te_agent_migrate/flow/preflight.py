@@ -597,6 +597,11 @@ def _test_checks(groups, share_aids, tests_by_aid, agent_id, warnings, blocked, 
             test_enabled[aid] = dict((t, None) for t in wanted)
             continue
         by_id = dict((str(t.test_id), t) for t in listing)
+        for test in listing:
+            ids = _test_agent_ids(test)
+            if ids is not None and agent_id in ids and str(test.test_id) not in set(map(str, wanted)):
+                blocked.append('conflicting assignment data for test %s in group %s; refresh the preview'
+                               % (test.test_id, aid))
 
         enabled = {}
         unknown = []
@@ -812,6 +817,8 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         return _blocked(inv, ['cannot read agents of the source group %s: %s' % (source, _err(exc))])
 
     _auto_kind(inv, source_records)
+    if inv.is_cluster and getattr(ctx, 'standalone_only', False):
+        return _blocked(inv, ['cluster migration is not qualified for production; use standalone agents only'])
     record, problem, warnings, done = _lookup(inv, groups, source, target, source_records, run_warnings)
     if done is not None:
         return done
@@ -906,6 +913,9 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
     tests_by_aid = {}
     for aid in share_aids:
         listed = record if aid == source else sharing['listing'].get(aid)
+        if listed is None or not listed.test_ids_known:
+            return _blocked(inv, ['test assignment data is missing or invalid in group %s' % aid],
+                            record=record, warnings=warnings)
         tests_by_aid[aid] = list(listed.test_ids) if listed is not None else []
 
     blocked = []

@@ -53,6 +53,11 @@ class MigrationConsole(object):
         self._lock = threading.RLock()
         self._last_task = None
         self._counters = {}
+        self.event_sink = None
+
+    def _record(self, agent, step, status, detail):
+        if self.event_sink is not None:
+            self.event_sink(self._host(agent), step, status, mask_secrets(detail))
 
     # ------------------------------------------------------------------ helpers
     def _paint(self, text, color):
@@ -133,9 +138,11 @@ class MigrationConsole(object):
 
     # ------------------------------------------------------------------ messages
     def info(self, scope, message):
+        self._record(scope, "info", "info", message)
         self._write("  [info] %s: %s" % (scope, self._clean(message)))
 
     def progress(self, agent, step, detail="in progress"):
+        self._record(agent, step, "started", detail)
         if not self.verbose:
             return
         self._write("  .. [%s] %s - %s" % (self._host(agent), step, self._clean(detail)))
@@ -145,6 +152,7 @@ class MigrationConsole(object):
         host = self._host(agent)
         label = ("%s:" % key).ljust(LABEL_WIDTH)
         text = self._clean(detail)
+        self._record(agent, step, key, text)
         with self._lock:
             if step:
                 self.task(step)

@@ -36,7 +36,7 @@ from te_agent_migrate.flow.preflight import (
 from te_agent_migrate.ui_client import TevaUiClient
 
 
-DRY_RUN_SCHEMA = 5
+DRY_RUN_SCHEMA = 6
 UI_USERNAME_ENV = "TE_AGENT_UI_USERNAME"
 UI_PASSWORD_ENV = "TE_AGENT_UI_PASSWORD"
 DRY_RUN_OK_FILENAME = "dry-run-ok.json"
@@ -205,6 +205,8 @@ def _finish_interrupted(console, prompter, report, api, source, agents, kwargs, 
         # Keep same-run protection even when the completion state cannot be saved.
         migrated_ids.add(str(result.new_agent_id))
         _remember_migrated(console, [result])
+        report.add_agent({"agent": entry.name, "status": "recovered",
+                          "new_agent_id": result.new_agent_id, "detail": result.detail})
         console.status(StepStatus.OK, entry.name, "resume", result.detail)
     return True
 
@@ -299,6 +301,8 @@ def _open_api(stack, prompter, report, console):
         token = env_token or prompter.secret("API v7 OAuth bearer token")
         attempt_stack = contextlib.ExitStack()
         api = attempt_stack.enter_context(ThousandEyesApiClient(token))
+        api.on_retry = lambda method, number, delay, reason: console.info(
+            "api_retry", "%s retry after attempt %s: %s; wait %.1fs" % (method, number, reason, delay))
         console.progress("global", "api_account_groups", "connecting to ThousandEyes API v7")
         try:
             groups = api.list_account_groups()
@@ -438,7 +442,9 @@ def _build_flow_context(kwargs, snapshot_dir):
     params["snapshot_dir"] = snapshot_dir
     while True:
         try:
-            return FlowContext(**params)
+            ctx = FlowContext(**params)
+            ctx.standalone_only = True
+            return ctx
         except TypeError as exc:
             names = [name for name in OPTIONAL_CONTEXT_PARAMS if name in params and name in str(exc)]
             if not names:
@@ -590,6 +596,10 @@ def _dry_run_binding(items, owner_is_source, default_target_aid=None, repoint_a2
                     "final_share_aids": sorted(desired_share_aids(item, target)),
                     "owner": "assumed" if getattr(item, "owner_assumed", False) else "proven",
                     "a2a_targets": _a2a_pairs(item),
+                    "tests_by_aid": {str(aid): sorted(str(t) for t in ids)
+                                     for aid, ids in item.tests_by_aid.items()},
+                    "test_enabled": {str(aid): dict(states) for aid, states in
+                                     (getattr(item, "test_enabled", {}) or {}).items()},
                 }
             )
         elif item.status == "excluded":
@@ -651,6 +661,9 @@ def _dry_run_problems(data, items, owner_is_source, default_target_aid=None, rep
         )
     for key in sorted(set(before) & set(after)):
         old, new = before[key], after[key]
+        for field in ("tests_by_aid", "test_enabled"):
+            if old.get(field) != new[field]:
+                problems.append("%s: %s changed since the approved preview" % (new["name"], field))
         if sorted(str(a) for a in old.get("share_aids") or []) != new["share_aids"]:
             problems.append(
                 "%s: share set changed from [%s] to [%s]"
@@ -854,6 +867,8 @@ def _run_migration(
     output, inventory_path, get_ui_credentials, dry_run_data=None, gate_path=None,
 ):
     apply_mode = selected_mode is Mode.APPLY
+    if any(agent.is_cluster for agent in agents):
+        raise FlowAborted("Cluster migration is not qualified for production; select standalone agents only.")
     snapshot_dir = Path(output) / "snapshots"
     target_names = dict((group.aid, group.name) for group in groups)
     target_labels = dict((aid, "%s [%s]" % (name, aid)) for aid, name in target_names.items())
@@ -983,6 +998,20 @@ def _run_migration(
             _consume_dry_run_file(gate_path)
             console.info("gate", "preview marked as used (%s.used)" % gate_path)
     ctx = _build_flow_context(kwargs, str(snapshot_dir))
+    if apply_mode:
+        approved = _dry_run_binding(pre_items, owner_is_source, default_target_aid, repoint_a2a)
+        approved["schema_version"] = DRY_RUN_SCHEMA
+        ctx.validate_preflight = lambda items: _compare_dry_run_binding(
+            approved, items, owner_is_source, default_target_aid, repoint_a2a)
+
+        def validate_device(item):
+            fresh = run_preflight(ctx=pre_ctx, inventory_agents=[item.inventory], all_aids=all_aids,
+                                  assume_owner_source=owner_is_source)
+            binding = _dry_run_binding([item], owner_is_source, default_target_aid, repoint_a2a)
+            binding["schema_version"] = DRY_RUN_SCHEMA
+            _compare_dry_run_binding(binding, fresh, owner_is_source, default_target_aid, repoint_a2a)
+
+        ctx.validate_device = validate_device
     ctx.migrated_ids = set(migrated_ids)
     ctx.target_tokens = dict(tokens)
     ctx.target_names = dict(target_names)
@@ -1067,6 +1096,10 @@ def main(argv=None):
     old_umask = os.umask(0o077)
     try:
         return _main(argv)
+    except OSError as exc:
+        _print_error("Local file operation failed: %s. No further migration steps will run; "
+                     "preserve work/ and inspect the last saved snapshot and report." % _mask_exception(exc))
+        return EXIT_FAILED
     finally:
         os.umask(old_umask)
 
@@ -1092,6 +1125,7 @@ def _main(argv=None):
     for note in _old_option_notes(args):
         console.info("startup", note)
     report = RunReport(output, selected_mode.value, {"inventory": str(inventory)})
+    console.event_sink = report.record_console
     prompter = OperatorPrompter(report.append_decision)
     try:
         if (

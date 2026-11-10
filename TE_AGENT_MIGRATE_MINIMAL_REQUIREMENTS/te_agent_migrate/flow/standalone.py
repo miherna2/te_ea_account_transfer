@@ -376,6 +376,8 @@ def _tests_on(ctx, aid, agent_id):
     """Ids of the tests that ``agent_id`` has in group ``aid`` right now (read only)."""
     for record in ctx.api.list_agents_with_clusters(aid):
         if record.agent_id == agent_id:
+            if not record.test_ids_known:
+                raise FlowAborted('agent %s has unreadable test assignments in group %s' % (agent_id, aid))
             return set(str(t) for t in record.test_ids)
     return set()
 
@@ -550,6 +552,57 @@ def _delete_type(ctx, owner, record, old_id):
     return agent_type
 
 
+def _live_groups(record, owner):
+    groups = record.raw.get('accountGroups')
+    if not isinstance(groups, list):
+        raise FlowAborted('agent %s sharing is unreadable; old agent was NOT deleted' % record.agent_id)
+    values = set([str(owner)])
+    for group in groups:
+        value = group.get('aid', group.get('accountGroupId', group.get('id'))) if isinstance(group, dict) else group
+        if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).isdigit():
+            raise FlowAborted('agent %s sharing is invalid; old agent was NOT deleted' % record.agent_id)
+        values.add(str(value))
+    return values
+
+
+def _verify_live_dependencies(ctx, item, old, current):
+    """Reconcile live dependencies, not only the pre-reset snapshot, before DELETE."""
+    old_id, new_id = str(old.agent_id), str(current.agent_id)
+    old_groups = _live_groups(old, item.owner_aid or ctx.source_aid)
+    required_groups = old_groups | set(_desired_groups(item, ctx.target_aid))
+    current_groups = _live_groups(current, ctx.target_aid)
+    missing_groups = required_groups - current_groups
+    if missing_groups:
+        raise FlowAborted('sharing changed; missing groups %s; old agent was NOT deleted'
+                          % _format_aids(sorted(missing_groups)))
+    for aid in sorted(required_groups | current_groups):
+        records = {str(r.agent_id): r for r in ctx.api.list_agents_with_clusters(aid)}
+        previous, replacement = records.get(old_id), records.get(new_id)
+        if (aid in old_groups and previous is None) or replacement is None or not replacement.test_ids_known or (
+                previous is not None and not previous.test_ids_known):
+            raise FlowAborted('cannot verify live assignments in group %s; old agent was NOT deleted' % aid)
+        needed = set(str(t) for t in item.tests_by_aid.get(aid, []))
+        if previous is not None:
+            needed.update(str(t) for t in previous.test_ids)
+        missing = needed - set(str(t) for t in replacement.test_ids)
+        if missing:
+            raise FlowAborted('live tests missing in group %s: %s; old agent was NOT deleted'
+                              % (aid, ','.join(sorted(missing))))
+        for test in ctx.api.list_tests(aid):
+            if test.test_type not in ('agent-to-agent', 'voice'):
+                continue
+            target = ThousandEyesApiClient._scalar_id(test.raw.get('targetAgentId'))
+            if target is None:
+                detail = ctx.api.get_test(aid, test.test_type, test.test_id)
+                target = ThousandEyesApiClient._scalar_id(detail.raw.get('targetAgentId'))
+                if str(detail.test_id) != str(test.test_id):
+                    target = None
+            if target is None or target == old_id:
+                raise FlowAborted('target dependency %s in group %s is unreadable or still uses the old agent; '
+                                  'old agent was NOT deleted' % (test.test_id, aid))
+    _verify_enabled(ctx, item, new_id)
+
+
 def _delete_old(ctx, item, old_id, new_id, state=None):
     owner = item.owner_aid or ctx.source_aid
     if old_id == new_id:
@@ -564,6 +617,16 @@ def _delete_old(ctx, item, old_id, new_id, state=None):
                 or str(current.agent_type or '').casefold() != 'enterprise'
                 or not ThousandEyesApiClient.match_new_agents([current], names, ips, [])):
             raise FlowAborted('new agent identity changed before cleanup; old agent was NOT deleted')
+        old = ctx.api.get_agent(owner, old_id)
+        if str(old.agent_id) != str(old_id):
+            raise FlowAborted('old agent identity changed; old agent was NOT deleted')
+        _verify_live_dependencies(ctx, item, old, current)
+        # Dependency reads can take time. Recheck both identities immediately before DELETE.
+        current = ctx.api.get_agent(ctx.target_aid, new_id)
+        if (str(current.agent_id) != str(new_id) or current.is_cluster
+                or str(current.agent_type or '').casefold() != 'enterprise'
+                or not ThousandEyesApiClient.match_new_agents([current], names, ips, [])):
+            raise FlowAborted('new agent identity or online state changed; old agent was NOT deleted')
         old = ctx.api.get_agent(owner, old_id)
         agent_type = _delete_type(ctx, owner, old, old_id)
         if (str(old.agent_id) != str(old_id) or old.is_cluster or agent_type.casefold() != 'enterprise'
@@ -748,6 +811,7 @@ def _run(ctx, item, host, state):
     new_id = new_agent.agent_id
     state.new_id = new_id
     state[0] = STATE_ONLINE
+    ctx.checkpoint_replacement(new_agent)
 
     _share_back(ctx, item, new_id)
     state[0] = STATE_SHARED

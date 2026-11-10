@@ -129,6 +129,14 @@ def run_migration(ctx, inventory_agents, console, all_aids=None, stop_on_failure
 
     try:
         items = _call_preflight(ctx, inventory_agents, all_aids, assume_owner_source)
+        if getattr(ctx, 'standalone_only', False):
+            for item in items:
+                if item.inventory.is_cluster:
+                    item.status = 'blocked'
+                    item.reasons.append('cluster migration is not qualified for production')
+        validator = getattr(ctx, 'validate_preflight', None)
+        if validator is not None:
+            validator(items)
     except Exception as exc:
         text = _fail(console, 'preflight', 'preflight failed, nothing was changed: %s' % exc)
         results.append(FlowResult('preflight', False, text))
@@ -206,6 +214,9 @@ def run_migration(ctx, inventory_agents, console, all_aids=None, stop_on_failure
         except AttributeError:
             pass
         try:
+            validate_device = getattr(ctx, 'validate_device', None)
+            if ctx.apply and validate_device is not None:
+                validate_device(item)
             if item.inventory.is_cluster:
                 if getattr(item, 'a2a_targets', None):
                     # Preflight blocks this case. Second guard: the cluster flow cannot repoint a2a tests.

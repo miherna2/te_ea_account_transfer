@@ -1,6 +1,7 @@
 # ThousandEyes Enterprise Agent Migration
 
 Moves ThousandEyes Enterprise Agents (TEVA appliances) from one account group to another.
+Only standalone agents are supported. The production CLI refuses clusters.
 
 - **Only the agent moves.** The tests stay in their account group and keep their IDs.
 - The new agent is shared with the same account groups that saw the old one, plus the source group.
@@ -73,6 +74,9 @@ The tool stops at the first failure and prints the device state. Before deleting
 online, shared with every required group, has all expected tests, and has the required agent-to-agent
 targets. Assignment uses batches of at most 10 and retries missing tests for up to three rounds.
 Saved enabled/disabled states must be preserved; a regression stops completion for manual correction.
+Before deletion, the tool reads live sharing, assignments and target dependencies again. Missing data or
+a dependency still using the old agent stops cleanup. Keep these settings unchanged during a migration:
+the API cannot make the final check and deletion one atomic operation.
 Name and tag restoration follows deletion. A rename failure stops the run even though A has already been
 deleted. Tag-restoration failures remain warnings and can accompany a successful exit: inspect them and
 finish the listed tags manually.
@@ -161,20 +165,9 @@ manual procedure.
 
 ### Standalone agents and clusters
 
-| | Standalone agent | Cluster |
-|---|---|---|
-| Inventory line | name and IP | name only (no IP) |
-| What moves | the agent | the cluster is taken apart and built again in the destination |
-| Maintenance window | allow for the appliance reset and registration | **yes**: while it moves, the tests that run on the cluster have no agent |
-| Tests that were enabled | checked again before old-agent deletion | may be disabled by ThousandEyes; the tool prints them as a manual list |
-
-The tool decides by itself: a line with an IP is a standalone agent; a line without one is looked up as a
-cluster. A cluster is never deleted: only its old member agents are, and only after the new cluster works.
-The option `--auto-reenable-tests` turns the disabled tests back on after a cluster move; leave it out if
-some tests hold masked secrets (the tool then prints the list and you enable them by hand). A cluster that
-stops half way is **not** finished automatically: the output says what was done and what is left.
-Clusters remain outside this project's current production scope. Their old member records are deleted
-only after their identity, membership, and offline state have been checked.
+Use a name and IP for each standalone agent. Allow for reset and registration downtime.
+Explicit and automatically detected clusters are refused before migration writes. A name-only row does
+not authorize a cluster move. An interrupted cluster move requires a separate manual procedure.
 
 ## Setup (once)
 
@@ -267,7 +260,7 @@ MyAgent-02,10.1.1.6
 | `name` | yes | the name of the agent, exactly as in the source group |
 | `ip_address` | yes for an agent | the IP address of the agent, exactly as in the source group |
 | `target` | no | the destination group of this device: its ID or its exact name. Each device can have a different one. Without it the tool uses `work/input/prefix_map.csv` (see [Examples](#examples)) and otherwise asks once |
-| `type` | no | `agent` or `cluster`. Without it a line with an IP is an agent and a line without an IP is a cluster |
+| `type` | no | Use `agent`. Cluster selections are refused |
 
 Good to know:
 
@@ -340,7 +333,7 @@ flowchart TD
     R["Run again"] --> S{"Snapshot of the old agent<br/>in work/apply or work/runs?"}
     S -- no --> N["Normal run"]
     S -- yes --> O{"Snapshot matches the selected device<br/>and source/destination;<br/>one matching new agent online?"}
-    O -- no --> N
+    O -- no --> BLOCK["Stop: inspect the identity or snapshot conflict"]
     O -- yes --> L["List what is left:<br/>share, tests, delete old agent, rename, tags"]
     L --> P{"--apply?"}
     P -- no --> I["Preview only tells you"]
@@ -353,6 +346,9 @@ Recovery uses the current inventory and source/destination selection. It require
 device identity, and one online replacement; an IP address alone is insufficient. It preserves existing
 live shares and adds missing shares and tests. The old standalone agent must be verified offline before
 deletion. A mismatch, ambiguous candidate, invalid test state, or failed check requires manual handling.
+The snapshot records the replacement ID after registration is verified and before test restoration.
+This checkpoint can identify a temporary name without a matching hostname. Older snapshots still require
+the stricter saved name/hostname match; a name suffix alone does not authorize recovery.
 Keep the snapshots in `work/apply` (or older `work/runs`) until recovery and post-migration checks are done.
 Older snapshots without saved enabled states produce a manual-verification warning: compare those tests
 with the operator's before-state, because the tool cannot prove their original enabled state.
@@ -373,7 +369,7 @@ again. See [Troubleshooting](#troubleshooting).
 |---|---|
 | Report of the last preview | `work/dry-run/` |
 | Reports of each apply | `work/apply/<date-time>/` |
-| Snapshot of each agent before its reset (settings, tests per group, tags, a2a targets) | `work/apply/<date-time>/snapshots/*.json` |
+| Snapshot and verified replacement checkpoint | `work/apply/<date-time>/snapshots/*.json` |
 | Devices already moved | `work/state/migrated.json` |
 | Typed or copied inventory | `work/input/inventory.csv` |
 | Optional prefix map | `work/input/prefix_map.csv` |
@@ -385,7 +381,7 @@ again. See [Troubleshooting](#troubleshooting).
 | `--apply` | Really moves the devices. Without it nothing changes |
 | `--inventory FILE` | Another inventory file. Default: `work/input/inventory.csv` |
 | `--timeout SECONDS` | How long to wait for each step, only if a step times out on a slow network |
-| `--auto-reenable-tests` | Clusters only: turn the tests that the move disabled back on. Default: print a manual list |
+| `--auto-reenable-tests` | Legacy compatibility option; does not repair standalone test states or enable cluster migration |
 | `-v` | More output |
 
 Older options (`--dry-run`, `--owner-is-source`, `--repoint-agent-to-agent`) are still accepted and do

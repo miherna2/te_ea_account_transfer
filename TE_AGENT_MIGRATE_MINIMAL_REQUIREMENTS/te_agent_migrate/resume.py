@@ -84,6 +84,17 @@ def _snapshot_problem(snap, old_id):
             or any(not _scalar(t) or (flag is not None and not isinstance(flag, bool))
                    for t, flag in flags.items()) for aid, flags in enabled.items())):
         return 'test_enabled contains invalid saved states'
+    replacement = snap.get('replacement')
+    if replacement is not None and (
+            not isinstance(replacement, dict)
+            or not _scalar(replacement.get('agent_id')).isdigit()
+            or _scalar(replacement.get('agent_id')) == str(old_id)
+            or _scalar(replacement.get('target_aid')) != target
+            or not _scalar(replacement.get('name'))
+            or not isinstance(replacement.get('ip_addresses'), list)
+            or not replacement['ip_addresses']
+            or any(not _ip(ip) for ip in replacement['ip_addresses'])):
+        return 'replacement checkpoint is invalid or belongs to another destination'
     return None
 
 
@@ -186,6 +197,19 @@ def _live_shares(record, target, label='new'):
     return have
 
 
+def _replacement_matches(record, snap, ip):
+    saved = snap.get('replacement')
+    if saved is None:
+        return _identity_matches(record, snap, ip)
+    return (str(record.agent_id) == str(saved['agent_id'])
+            and str(record.agent_type).casefold() == 'enterprise'
+            and _ip(ip) in _ips(record)
+            and _ip(ip) in set(_ip(value) for value in saved['ip_addresses'])
+            and (_identity_matches(record, snap, ip)
+                 or _norm(record.name) == _norm(saved['name'])
+                 or (saved.get('hostname') and _norm(record.hostname) == _norm(saved['hostname']))))
+
+
 def _tag_on(api, tag, new_id):
     for entry in api.list_tags(tag['aid'], expand_assignments=True):
         if str(entry.get('tagId', entry.get('id'))) == str(tag['tagId']):
@@ -224,6 +248,8 @@ def _wanted_tests(api, snap, old_record, old_id):
             try:
                 for record in api.list_agents_with_clusters(aid):
                     if str(record.agent_id) == old_id:
+                        if not record.test_ids_known:
+                            raise FlowAborted('old agent assignments are unreadable in group %s' % aid)
                         held = set(str(t) for t in record.test_ids)
             except ApiError as exc:
                 raise FlowAborted('cannot read old agent tests in group %s (%s); no recovery changes were made'
@@ -311,7 +337,7 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
     if target not in target_cache:
         target_cache[target] = api.list_agents(target)
     same_ip = [r for r in target_cache[target] if str(r.agent_id) != old_id and ip in _ips(r)]
-    news = [r for r in same_ip if _identity_matches(r, snap, ip)]
+    news = [r for r in same_ip if _replacement_matches(r, snap, ip)]
     if not news and not same_ip and old_record is not None:
         return None
     if not news:
@@ -325,7 +351,7 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
         old_record = _read_old(api, snap, old_id, ip)
     wanted = _wanted_tests(api, snap, old_record, old_id)
     detail = api.get_agent(target, new_id)
-    if str(detail.agent_id) != new_id or not _identity_matches(detail, snap, ip):
+    if str(detail.agent_id) != new_id or not _replacement_matches(detail, snap, ip):
         _refuse(snap['name'], path, 'new agent detail does not match its recorded identity')
     groups = [g for g in _desired_groups(_item_from_snapshot(snap, old_record, wanted, []), target)]
     have = _live_shares(detail, target)
@@ -362,6 +388,8 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
 def _tests_on_api(api, aid, agent_id):
     for record in api.list_agents_with_clusters(aid):
         if str(record.agent_id) == str(agent_id):
+            if not record.test_ids_known:
+                raise FlowAborted('replacement assignments are unreadable in group %s' % aid)
             return set(str(t) for t in record.test_ids)
     return set()
 
@@ -466,7 +494,7 @@ def resume_device(ctx, interrupted):
     state = _State('resuming; new agent %s; old agent %s' % (new_id, old_id))
     warnings = []
     current = ctx.api.get_agent(ctx.target_aid, new_id)
-    if str(current.agent_id) != str(new_id) or not _identity_matches(current, interrupted.snapshot, item.ui_ip):
+    if str(current.agent_id) != str(new_id) or not _replacement_matches(current, interrupted.snapshot, item.ui_ip):
         raise FlowAborted('new agent identity changed; no recovery changes were made')
     if not current.online:
         raise FlowAborted('new agent %s is %s, not online; nothing was changed. Start the agent and run again'

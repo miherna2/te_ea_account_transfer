@@ -138,6 +138,7 @@ class ThousandEyesApiClient(object):
         # error_detail: add the reason that the API sends with a 4xx answer to the error text.
         # OFF by default: an answer may repeat submitted values. Only the sandbox tools turn it on.
         self._error_detail = bool(error_detail)
+        self.on_retry = None
         self.base_url = base_url.rstrip("/") + "/"
         self._retry = retry_policy or RetryPolicy()
         self._sleep = sleep
@@ -200,7 +201,10 @@ class ThousandEyesApiClient(object):
             except requests.RequestException as exc:
                 if attempt == attempts or not retryable:
                     raise ApiError("API %s %s failed: %s" % (method, path, exc))
-                self._sleep(self._retry.delay(attempt))
+                delay = self._retry.delay(attempt)
+                if self.on_retry is not None:
+                    self.on_retry(method, attempt, delay, "connection failure")
+                self._sleep(delay)
                 continue
             if response.status_code in expected:
                 if method.upper() in WRITE_METHODS:
@@ -222,6 +226,8 @@ class ThousandEyesApiClient(object):
             if retry_status and attempt < attempts:
                 retry_after = response.headers.get("retry-after")
                 delay = retry_after_seconds(retry_after, self._retry.delay(attempt))
+                if self.on_retry is not None:
+                    self.on_retry(method, attempt, delay, "HTTP %s" % response.status_code)
                 self._sleep(delay)
                 continue
             break
@@ -239,10 +245,12 @@ class ThousandEyesApiClient(object):
         candidates = payload.get(preferred_key, payload.get("items"))
         if candidates is None:
             embedded = payload.get("_embedded", {})
-            candidates = embedded.get(preferred_key, []) if isinstance(embedded, dict) else []
+            candidates = embedded.get(preferred_key) if isinstance(embedded, dict) else None
         if not isinstance(candidates, list):
             raise ApiError("API response field %r was not a list" % preferred_key)
-        return [item for item in candidates if isinstance(item, dict)]
+        if any(not isinstance(item, dict) for item in candidates):
+            raise ApiError("API response field %r contains invalid records" % preferred_key)
+        return candidates
 
     def _paginate(self, path, preferred_key, aid=None, params=None):
         next_path = path
