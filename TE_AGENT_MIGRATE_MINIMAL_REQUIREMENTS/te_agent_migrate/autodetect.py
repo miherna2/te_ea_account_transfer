@@ -8,6 +8,7 @@
   otherwise one question for the whole run.
 """
 import os
+import time
 
 from te_agent_migrate.errors import ConfigurationError
 from te_agent_migrate.scope import load_prefix_map, prefix_key, prefix_of
@@ -38,17 +39,22 @@ def scan_groups(api, groups, agents, console=None):
     """Return ({aid: number of inventory rows that group sees}, [aids that could not be read])."""
     seen = {}
     unreadable = []
+    started = time.monotonic()
     for position, group in enumerate(groups, start=1):
-        if console is not None and position % 10 == 0:
-            console.info('source', 'looked in %d of %d account groups' % (position, len(groups)))
+        if console is not None:
+            console.info('source', 'reading group %d/%d: %s [%s]; elapsed %.1fs'
+                         % (position, len(groups), group.name, group.aid, time.monotonic() - started))
         try:
-            records = api.list_agents_with_clusters(group.aid)
+            records = api.list_agent_identities(group.aid)
         except Exception:  # a group that this token cannot read is only skipped
             unreadable.append(group.aid)
             continue
         count = sum(1 for agent in agents if any(sees(record, agent) for record in records))
         if count:
             seen[group.aid] = count
+    if console is not None:
+        console.info('source', 'discovery finished: %d groups checked in %.1fs'
+                     % (len(groups), time.monotonic() - started))
     return seen, unreadable
 
 

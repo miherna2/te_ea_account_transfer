@@ -265,7 +265,7 @@ def _wanted_tests(api, snap, old_record, old_id):
         for aid in sorted(aids):
             held = set()
             try:
-                for record in api.list_agents_with_clusters(aid):
+                for record in api.list_agent_identities(aid, assignment_ids=[old_id]):
                     if str(record.agent_id) == old_id:
                         if not record.test_ids_known:
                             raise FlowAborted('old agent assignments are unreadable in group %s' % aid)
@@ -288,7 +288,7 @@ def find_interrupted(api, source_aid, agents, snapshots, console=None, target_ai
         if problem:
             _refuse('saved recovery state', path, problem)
     try:
-        source_records = api.list_agents_with_clusters(source_aid)
+        source_records = api.list_agent_identities(source_aid)
     except ApiError as exc:
         raise FlowAborted('cannot inspect earlier migrations in source group %s (%s)' % (source_aid, exc))
     source_by_id = dict((str(r.agent_id), r) for r in source_records)
@@ -353,7 +353,7 @@ def find_interrupted(api, source_aid, agents, snapshots, console=None, target_ai
 def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
     target = str(snap['target_aid'])
     if target not in target_cache:
-        target_cache[target] = api.list_agents(target)
+        target_cache[target] = api.list_agent_identities(target, agent_types='enterprise')
     same_ip = [r for r in target_cache[target] if str(r.agent_id) != old_id and ip in _ips(r)]
     news = [r for r in same_ip if _replacement_matches(r, snap, ip)]
     if not news and not same_ip and old_record is not None and snap.get('replacement') is None:
@@ -407,7 +407,7 @@ def _inspect(api, snap, path, old_id, old_record, target_cache, ip):
 
 
 def _tests_on_api(api, aid, agent_id):
-    for record in api.list_agents_with_clusters(aid):
+    for record in api.list_agent_identities(aid, assignment_ids=[agent_id]):
         if str(record.agent_id) == str(agent_id):
             if not record.test_ids_known:
                 raise FlowAborted('replacement assignments are unreadable in group %s' % aid)

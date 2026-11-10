@@ -77,7 +77,7 @@ migration: normal assignment does not preserve its per-agent `sourceIpAddress`. 
 qualified manual procedure. A source group's visibility alone does not establish ownership.
 Compare discovered groups with the known sharing list: groups hidden from both the token and returned API
 metadata cannot be proven dependency-free by an empty scan.
-When an agent list omits assignment fields, the tool requests expanded test IDs from that agent's
+When a selected agent's list entry omits assignment fields, the tool requests expanded test IDs from that agent's
 detail endpoint in the same group. Only a matching ID and an explicit valid list establish its assignments.
 Unresolved or malformed assignment data remains a blocker, not proof of zero tests.
 
@@ -92,6 +92,20 @@ confirmation and may change those devices before normal new-migration preflight.
 preflight for new migrations, compares any usable earlier preview, collects destination registration
 tokens, asks you to confirm source ownership, checks the agent UIs, and asks
 `Begin destructive migration actions? (y/n)`.
+
+A matching preview supplies the source and destination selections, so apply does not repeat source
+discovery. Explicit environment selections still take precedence and must match a strict preview.
+New previews also record complete discovery coverage; unreadable groups do not count as complete.
+When access and live sharing still match,
+validation checks the selected agents' sharing groups instead of scanning every accessible group.
+It reads current test listings in those groups to find new assignments and target dependencies, not
+only the test IDs in the preview. Changed sharing or access requires broader discovery; unreadable
+required data stops the run. Older schema 8 previews without coverage still work, but need broader validation.
+
+The initial validated plan is reused by the runner. A separate fresh check before each device's reset
+detects changes since confirmation; retirement has its own live checks. API listing caches are not reused
+across these safety boundaries. Group/page progress, elapsed validation time and retry waits are printed without `--verbose`.
+Reading another group does not mean that its other agents will be migrated.
 
 The default workflow can proceed from that fresh confirmed plan if the earlier preview is missing or
 changed; it reports the difference. For a mandatory matching saved preview, use the strict option below.

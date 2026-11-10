@@ -114,6 +114,7 @@ Stale ids and moved devices
   the target group block the item.
 """
 import ipaddress
+import time
 
 from te_agent_migrate.errors import ApiError
 from te_agent_migrate.models import StepStatus
@@ -223,12 +224,19 @@ class _Groups(object):
     Errors are cached too, so a group that fails is not retried for every item.
     """
 
-    def __init__(self, api):
+    def __init__(self, api, console=None):
         self.api = api
+        self.console = console
+        self.started = time.monotonic()
         self._agents = {}
         self._tags = {}
         self._tests = {}
         self._test_details = {}
+
+    def progress(self, detail):
+        info = getattr(self.console, 'info', None)
+        if info is not None:
+            info('preflight', '%s; elapsed %.1fs' % (detail, time.monotonic() - self.started))
 
     @staticmethod
     def _cached(store, key, loader):
@@ -244,7 +252,14 @@ class _Groups(object):
 
     def agents(self, aid):
         aid = str(aid)
-        return self._cached(self._agents, aid, lambda: self.api.list_agents_with_clusters(aid))
+        if aid not in self._agents:
+            self.progress('reading agent identities in group %s' % aid)
+        return self._cached(self._agents, aid, lambda: self.api.list_agent_identities(aid))
+
+    def assignments(self, aid, record):
+        if not record.test_ids_known and 'testIds' not in record.raw and 'tests' not in record.raw:
+            return self.api.get_agent_assignments(aid, record)
+        return record
 
     def tags(self, aid):
         aid = str(aid)
@@ -252,10 +267,14 @@ class _Groups(object):
 
     def tests(self, aid):
         aid = str(aid)
+        if aid not in self._tests:
+            self.progress('reading tests and target dependencies in group %s' % aid)
         return self._cached(self._tests, aid, lambda: self.api.list_tests(aid))
 
     def test_detail(self, aid, test):
         key = (str(aid), str(test.test_type), str(test.test_id))
+        if key not in self._test_details and len(self._test_details) % 10 == 0:
+            self.progress('test details checked: %d; reading group %s' % (len(self._test_details), aid))
         return self._cached(self._test_details, key,
                             lambda: [self.api.get_test(*key)])[0]
 
@@ -441,7 +460,7 @@ def _sharing_check(ctx, record, groups, scan_aids, assume_owner_source=False):
     source = str(ctx.source_aid)
     agent_id = str(record.agent_id)
     out = {'blocked': [], 'warnings': [], 'share_aids': [], 'owner_proven': False, 'owner_assumed': False,
-           'sources': {'get_agent': [], 'scan': []}, 'listing': {}}
+           'sources': {'get_agent': [], 'scan': []}, 'listing': {}, 'discovery_complete': False}
 
     try:
         detail = ctx.api.get_agent(source, agent_id)
@@ -475,12 +494,30 @@ def _sharing_check(ctx, record, groups, scan_aids, assume_owner_source=False):
         out['blocked'].append('%s: accountGroups of agent %s could not be parsed' % (REASON_SHARING, agent_id))
         return out
 
+    from te_agent_migrate.api_client import ThousandEyesApiClient
+    ids = [ThousandEyesApiClient._scalar_id(
+        value.get('aid', value.get('accountGroupId', value.get('id')))
+        if isinstance(value, dict) else value) for value in detail.raw['accountGroups']]
+    if any(value is None or not value.isdigit() for value in ids):
+        out['blocked'].append('live sharing metadata is malformed; validation refused')
+        return out
     detail_set = set(str(a) for a in detail.shared_aids) | set([source])
 
-    # scan every reachable group for the same agent id
+    # A previously complete discovery can be narrowed only while the live share set agrees.
+    saved = getattr(ctx, 'preview_bindings', {}).get(agent_id)
+    if saved and set(saved.get('share_aids', [])) == detail_set:
+        scan_aids = sorted(detail_set)
+        groups.progress('%s: validating %d known sharing groups from the preview'
+                        % (record.name, len(scan_aids)))
+    elif saved:
+        groups.progress('%s: sharing changed; performing full discovery' % record.name)
+
     scan_set = set()
     unreadable = []
-    for aid in sorted(set(scan_aids) | detail_set):
+    selected_aids = sorted(set(scan_aids) | detail_set)
+    for position, aid in enumerate(selected_aids, 1):
+        groups.progress('%s: checking sharing group %d/%d [%s]'
+                        % (record.name, position, len(selected_aids), aid))
         try:
             listing = groups.agents(aid)
         except ApiError as exc:
@@ -506,6 +543,7 @@ def _sharing_check(ctx, record, groups, scan_aids, assume_owner_source=False):
             'group listing scan = %s' % (agent_id, agent_id, _aids_text(detail_set), _aids_text(scan_set)))
         return out
     out['share_aids'] = sorted(detail_set)
+    out['discovery_complete'] = not unreadable
     return out
 
 
@@ -937,6 +975,12 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
     tests_by_aid = {}
     for aid in share_aids:
         listed = record if aid == source else sharing['listing'].get(aid)
+        if listed is not None:
+            try:
+                listed = groups.assignments(aid, listed)
+            except ApiError as exc:
+                return _blocked(inv, ['cannot verify assignments in group %s: %s' % (aid, _err(exc))],
+                                record=record, warnings=warnings)
         if listed is None or not listed.test_ids_known:
             return _blocked(inv, ['test assignment data is missing or invalid in group %s' % aid],
                             record=record, warnings=warnings)
@@ -973,6 +1017,7 @@ def _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner
         owner_assumed=sharing['owner_assumed'], a2a_targets=a2a_targets,
     )
     item.visible_in_target = bool(visible_in_target)
+    item.discovery_complete = sharing['discovery_complete']
     return item
 
 
@@ -1001,15 +1046,17 @@ def run_preflight(ctx, inventory_agents, all_aids=None, assume_owner_source=Fals
     no owner field, the source group is taken as owner and a warning is added. A field that
     names another group still blocks.
     """
-    groups = _Groups(ctx.api)
+    groups = _Groups(ctx.api, ctx.console)
     inventory_agents = list(inventory_agents)
     scan_aids, run_warnings = _scan_groups(ctx, all_aids, inventory_agents)
     seen_ids = {}
     items = []
     for inv in inventory_agents:
+        groups.progress('checking device %d/%d: %s' % (len(items) + 1, len(inventory_agents), inv.hostname))
         item = _check_one(ctx, inv, groups, seen_ids, scan_aids, run_warnings, assume_owner_source)
         item.target_aid = _inv_target(ctx, inv)
         items.append(item)
+    groups.progress('validation finished for %d device(s)' % len(items))
     return items
 
 

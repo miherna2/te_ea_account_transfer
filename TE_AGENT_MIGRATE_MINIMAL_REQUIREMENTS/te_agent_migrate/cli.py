@@ -274,11 +274,21 @@ def _group_from_env(groups, env_name, label, prompter, exclude_aid=None):
     return prompter.choose_account_group("Select %s account group" % label, choices)
 
 
-def _source_group(api, groups, agents, prompter, console):
-    """The source group: from TE_SOURCE_AID (labs), else found by looking for the devices."""
+def _preview_group(groups, preview, key, console):
+    if preview:
+        group = next((g for g in groups if g.aid == str(preview.get(key))), None)
+        if group is not None:
+            console.info("gate", "reusing preview %s: %s [%s]" % (key, group.name, group.aid))
+            return group
+    return None
+
+
+def _source_group(api, groups, agents, prompter, console, preview=None):
+    """Use an explicit source or a matching preview before discovering the devices."""
     if os.getenv("TE_SOURCE_AID"):
         return _group_from_env(groups, "TE_SOURCE_AID", "source", prompter)
-    return detect_source(api, groups, agents, prompter, console)
+    return (_preview_group(groups, preview, "source_aid", console)
+            or detect_source(api, groups, agents, prompter, console))
 
 
 def _auth_failed(exc):
@@ -304,6 +314,8 @@ def _open_api(stack, prompter, report, console):
         api = attempt_stack.enter_context(ThousandEyesApiClient(token))
         api.on_retry = lambda method, number, delay, reason: console.info(
             "api_retry", "%s retry after attempt %s: %s; wait %.1fs" % (method, number, reason, delay))
+        api.on_page = lambda resource, aid, page: console.info(
+            "api_read", "%s: group %s, page %d" % (resource, aid if aid is not None else "accessible", page))
         console.progress("global", "api_account_groups", "connecting to ThousandEyes API v7")
         try:
             groups = api.list_account_groups()
@@ -732,7 +744,7 @@ def _consume_dry_run_file(path_text):
 
 def _update_dry_run_confirmation(
     output, clean, inventory_path, source, default_target_aid, agents, items=None, owner_is_source=False,
-    target_aids=None, repoint_a2a=False,
+    target_aids=None, repoint_a2a=False, discovery_aids=None,
 ):
     """Write dry-run-ok.json after a clean dry run. Remove an older one when not clean.
 
@@ -756,6 +768,9 @@ def _update_dry_run_confirmation(
         "target_aids": sorted(set(str(aid) for aid in (target_aids or []))),
         "entries": len(agents),
         "created_utc": _utc_now_text(),
+        "discovery_aids": (sorted(set(str(aid) for aid in (discovery_aids or [])))
+                           if all(getattr(item, "discovery_complete", False)
+                                  for item in items if item.status == "ready") else []),
     }
     payload.update(_dry_run_binding(items, owner_is_source, default_target_aid, repoint_a2a))
     _write_private_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -921,6 +936,15 @@ def _run_migration(
         current_ctx = _build_flow_context(pre_kwargs, str(snapshot_dir))
         current_ctx.target_names = dict(target_names)
         current_ctx.migrated_ids = set(migrated_ids)
+        if (dry_run_data and dry_run_data.get("discovery_aids") == sorted(set(all_aids))
+                and isinstance(dry_run_data.get("ready"), list)
+                and all(isinstance(entry, dict) and isinstance(entry.get("share_aids"), list)
+                        for entry in dry_run_data["ready"])):
+            current_ctx.preview_bindings = {
+                str(entry.get("agent_id")): entry for entry in dry_run_data["ready"]}
+        elif dry_run_data:
+            console.info("gate", "preview coverage is missing or group access changed; "
+                         "full sharing discovery is required")
         current_items = run_preflight(
             ctx=current_ctx, inventory_agents=agents, all_aids=all_aids,
             assume_owner_source=owner_is_source,
@@ -1009,10 +1033,16 @@ def _run_migration(
     if apply_mode:
         approved = _dry_run_binding(pre_items, owner_is_source, default_target_aid, repoint_a2a)
         approved["schema_version"] = DRY_RUN_SCHEMA
+        ctx.preflight_items = pre_items
+        covered = set(_item_agent_id(item) for item in pre_items
+                      if getattr(item, "discovery_complete", False))
+        pre_ctx.preview_bindings = {str(entry["agent_id"]): entry for entry in approved["ready"]
+                                    if str(entry["agent_id"]) in covered}
         ctx.validate_preflight = lambda items: _compare_dry_run_binding(
             approved, items, owner_is_source, default_target_aid, repoint_a2a)
 
         def validate_device(item):
+            console.info("preflight", "%s: fresh validation before reset" % item.name)
             fresh = run_preflight(ctx=pre_ctx, inventory_agents=[item.inventory], all_aids=all_aids,
                                   assume_owner_source=owner_is_source)
             binding = _dry_run_binding([item], owner_is_source, default_target_aid, repoint_a2a)
@@ -1076,7 +1106,7 @@ def _run_migration(
             output, clean and not nothing_ready and not getattr(results, "blocked", False),
             inventory_path, source, default_target_aid, agents,
             items=getattr(results, "preflight_items", None), owner_is_source=owner_is_source,
-            target_aids=all_target_aids, repoint_a2a=repoint_a2a,
+            target_aids=all_target_aids, repoint_a2a=repoint_a2a, discovery_aids=all_aids,
         )
     summary_path = _write_summary(
         report, results, selected_mode, source, target, snapshot_dir, code, all_target_aids, repoint_a2a
@@ -1180,12 +1210,15 @@ def _main(argv=None):
             # Group names and the prefix map become group ids; an unknown target stops the run before any prompt.
             resolve_targets(agents, groups, PREFIX_MAP_FILE, console)
             _check_inventory_targets(agents, groups)
-            source = _source_group(api, groups, agents, prompter, console)
+            source = _source_group(api, groups, agents, prompter, console, preview=dry_run_data)
             own_targets = any(agent.target_aid for agent in agents)
             # When every row names its target, the run needs no target of its own.
             needs_target = _needs_run_target(agents)
             if needs_target:
-                target = _group_from_env(groups, "TE_TARGET_AID", "target", prompter, exclude_aid=source.aid)
+                target = (None if os.getenv("TE_TARGET_AID") else
+                          _preview_group(groups, dry_run_data, "target_aid", console))
+                if target is None:
+                    target = _group_from_env(groups, "TE_TARGET_AID", "target", prompter, exclude_aid=source.aid)
             else:
                 # Every row has its own target. The run target is the first one (for the context only).
                 target = next(group for group in groups if group.aid == agents[0].target_aid)

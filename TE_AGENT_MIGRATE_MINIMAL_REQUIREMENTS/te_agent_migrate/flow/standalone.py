@@ -274,7 +274,7 @@ def _validate(ctx, item):
 def _prior_source_ids(ctx, item, ip, old_id):
     ids = set([old_id])
     for aid in _source_aids(ctx, item):
-        for agent in ctx.api.list_agents(aid):
+        for agent in ctx.api.list_agent_identities(aid, agent_types='enterprise'):
             if _identity_matches(agent, ip, item.name):
                 ids.add(agent.agent_id)
     return ids
@@ -282,7 +282,7 @@ def _prior_source_ids(ctx, item, ip, old_id):
 
 def _require_clean_target(ctx, item, ip, old_id):
     """GET only. Abort when the target already has an online agent for the device. Returns the target listing."""
-    listing = list(ctx.api.list_agents(ctx.target_aid))
+    listing = list(ctx.api.list_agent_identities(ctx.target_aid, agent_types='enterprise'))
     existing = [a for a in listing
                 if a.online and a.agent_id != old_id and _identity_matches(a, ip, item.name)]
     if existing:
@@ -297,7 +297,8 @@ def _require_no_new_source_identity(ctx, item, ip, prior_ids):
     names = _name_candidates(item)
     ips = _unique([ip] + _device_ips(item))
     for aid in _source_aids(ctx, item):
-        unexpected = ThousandEyesApiClient.match_new_agents(ctx.api.list_agents(aid), names, ips, prior_ids)
+        unexpected = ThousandEyesApiClient.match_new_agents(
+            ctx.api.list_agent_identities(aid, agent_types='enterprise'), names, ips, prior_ids)
         if unexpected:
             raise FlowAborted(
                 'a new online agent appeared in source aid %s (agent id %s) after the target token was submitted; '
@@ -332,7 +333,7 @@ def _wait_target_online(ctx, item, ip, old_id, prior_ids, target_known):
                               'agent cannot be told apart. Nothing was shared, assigned or deleted; manual '
                               'action needed' % (ctx.target_aid, item.name, ', '.join(exc.agent_ids) or '?'))
         except VisibilityTimeout as exc:
-            seen = [a for a in ctx.api.list_agents(ctx.target_aid)
+            seen = [a for a in ctx.api.list_agent_identities(ctx.target_aid, agent_types='enterprise')
                     if a.online and a.agent_id in known and _identity_matches(a, ip, item.name)]
             if seen:
                 raise FlowAborted('target aid %s returns only known agent id %s for %s; no new identity appeared'
@@ -377,7 +378,7 @@ def _share_back(ctx, item, new_id):
 
 def _tests_on(ctx, aid, agent_id):
     """Ids of the tests that ``agent_id`` has in group ``aid`` right now (read only)."""
-    for record in ctx.api.list_agents_with_clusters(aid):
+    for record in ctx.api.list_agent_identities(aid, assignment_ids=[agent_id]):
         if record.agent_id == agent_id:
             if not record.test_ids_known:
                 raise FlowAborted('agent %s has unreadable test assignments in group %s' % (agent_id, aid))
@@ -487,7 +488,7 @@ def _assign_tests(ctx, item, new_id):
 
             def probe(aid=aid, needed=needed):
                 have = set()
-                for record in ctx.api.list_agents_with_clusters(aid):
+                for record in ctx.api.list_agent_identities(aid, assignment_ids=[new_id]):
                     if record.agent_id == new_id:
                         have = set(str(t) for t in record.test_ids)
                         break
@@ -579,7 +580,9 @@ def _verify_live_dependencies(ctx, item, old, current):
         raise FlowAborted('sharing changed; missing groups %s; old agent was NOT deleted'
                           % _format_aids(sorted(missing_groups)))
     for aid in sorted(required_groups | current_groups):
-        records = {str(r.agent_id): r for r in ctx.api.list_agents_with_clusters(aid)}
+        ctx.console.info(item.name, 'verifying live dependencies before retirement in group %s' % aid)
+        records = {str(r.agent_id): r for r in
+                   ctx.api.list_agent_identities(aid, assignment_ids=[old_id, new_id])}
         previous, replacement = records.get(old_id), records.get(new_id)
         if (aid in old_groups and previous is None) or replacement is None or not replacement.test_ids_known or (
                 previous is not None and not previous.test_ids_known):

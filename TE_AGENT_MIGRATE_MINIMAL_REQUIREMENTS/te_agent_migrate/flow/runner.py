@@ -128,7 +128,9 @@ def run_migration(ctx, inventory_agents, console, all_aids=None, stop_on_failure
     console.play(PLAY_TITLE, mode)
 
     try:
-        items = _call_preflight(ctx, inventory_agents, all_aids, assume_owner_source)
+        items = getattr(ctx, 'preflight_items', None) if ctx.apply else None
+        if items is None:
+            items = _call_preflight(ctx, inventory_agents, all_aids, assume_owner_source)
         if getattr(ctx, 'standalone_only', False):
             for item in items:
                 if item.inventory.is_cluster:

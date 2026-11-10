@@ -119,6 +119,12 @@ flowchart TD
 The pre-reset check happens **before** the first new migration reset. Completing an earlier interrupted
 migration has its own confirmation and can change that device before the new-migration checks.
 
+With a matching saved preview, apply reuses the source and destination selections instead of repeating
+source discovery. It validates the selected agents and their sharing groups with fresh reads; it does not
+reuse old test states as current facts. A changed share set or account-group access, or an older preview
+without discovery coverage, requires a broader check. Discovery does not fetch assignment details for
+unrelated agents. Progress shows the current phase, group, API page and elapsed validation time.
+
 ### Name and IP must match (protects you from moving the wrong device)
 
 ```

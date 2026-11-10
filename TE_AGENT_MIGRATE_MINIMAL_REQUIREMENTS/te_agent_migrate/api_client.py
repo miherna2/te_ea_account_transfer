@@ -139,6 +139,7 @@ class ThousandEyesApiClient(object):
         # OFF by default: an answer may repeat submitted values. Only the sandbox tools turn it on.
         self._error_detail = bool(error_detail)
         self.on_retry = None
+        self.on_page = None
         self.base_url = base_url.rstrip("/") + "/"
         self._retry = retry_policy or RetryPolicy()
         self._sleep = sleep
@@ -255,7 +256,12 @@ class ThousandEyesApiClient(object):
     def _paginate(self, path, preferred_key, aid=None, params=None):
         next_path = path
         query = dict(params or {})
+        page = 0
+        group = aid
         while next_path:
+            page += 1
+            if self.on_page is not None:
+                self.on_page(preferred_key, group, page)
             payload = self.request("GET", next_path, aid=aid, params=query)
             for item in self._items(payload, preferred_key):
                 yield item
@@ -306,6 +312,24 @@ class ThousandEyesApiClient(object):
             record.test_ids = list(detail.test_ids)
             record.test_ids_known = True
             record.raw["testIds"] = list(detail.test_ids)
+        return record
+
+    def list_agent_identities(self, aid, assignment_ids=(), agent_types="enterprise,enterprise-cluster"):
+        """List visibility without resolving assignments of unrelated registrations."""
+        selected = set(str(value) for value in assignment_ids)
+        params = {"agentTypes": agent_types, "expand": "cluster-member"}
+        return [
+            self._listed_agent(raw, aid) if str(raw.get("agentId", raw.get("id"))) in selected
+            else AgentRecord.from_api(raw, aid)
+            for raw in self._paginate("agents", "agents", aid=aid, params=params)
+        ]
+
+    def get_agent_assignments(self, aid, record):
+        """Resolve omitted assignments for one selected listing record, in its group."""
+        resolved = self._listed_agent(record.raw, aid)
+        record.test_ids = resolved.test_ids
+        record.test_ids_known = resolved.test_ids_known
+        record.raw = resolved.raw
         return record
 
     def get_agent(self, aid, agent_id, expand="cluster-member"):
@@ -469,14 +493,14 @@ class ThousandEyesApiClient(object):
                 on_poll(poll_number, remaining)
             if known_ids is None:
                 agent = self.match_agent(
-                    self.list_agents(aid),
+                    self.list_agent_identities(aid, agent_types="enterprise"),
                     hostname=hostname,
                     ip_address=ip_address,
                     online_only=True,
                 )
             else:
                 found = self.match_new_agents(
-                    self.list_agents(aid),
+                    self.list_agent_identities(aid, agent_types="enterprise"),
                     [hostname] + list(alt_names or []),
                     [ip_address] + list(alt_ips or []),
                     known_ids,
@@ -546,7 +570,7 @@ class ThousandEyesApiClient(object):
             remaining = max(0.0, deadline - self._monotonic())
             if on_poll is not None:
                 on_poll(poll_number, remaining)
-            agent = self.find_agent_by_id(self.list_agents(aid), agent_id)
+            agent = self.find_agent_by_id(self.list_agent_identities(aid, agent_types="enterprise"), agent_id)
             if agent is not None and agent.online and agent.name == expected_name:
                 return agent
             remaining = deadline - self._monotonic()
